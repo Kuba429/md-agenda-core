@@ -1,4 +1,9 @@
+pub mod backlinks;
 pub mod cli;
+pub mod config;
 pub mod fs_utils;
 pub mod grep;
+pub mod integration_tests;
+pub mod repository;
 pub mod task;
+pub mod utils;
