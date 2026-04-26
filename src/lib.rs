@@ -4,6 +4,7 @@ pub mod config;
 pub mod fs_utils;
 pub mod grep;
 pub mod integration_tests;
+pub mod query;
 pub mod repository;
 pub mod task;
 pub mod utils;

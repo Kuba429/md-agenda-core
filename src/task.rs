@@ -2,7 +2,6 @@ use crate::config::AgendaConfig;
 use crate::fs_utils::{file_line_insert, file_lines_get};
 use crate::grep::{tasks_grep, TASK_STATES};
 use crate::repository::TaskRepository;
-use crate::utils::group_by;
 use indexmap::IndexMap;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -24,10 +23,10 @@ pub fn is_state_tag(tag: &str) -> bool {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Task {
-    pub content: String,
+    pub title: String,
     pub state: String,
-    pub nest_level: u8,
     pub tags: Vec<String>,
+    pub raw: String,
     pub body: String,
     pub id: String,
     pub parent: Option<String>,
@@ -37,7 +36,7 @@ pub struct Task {
 
 impl Task {
     pub fn tags_populate(&mut self) {
-        TAG_RE.find_iter(&self.body).for_each(|i| {
+        TAG_RE.find_iter(&self.raw).for_each(|i| {
             let tag = (&(i.as_str())[1..]).to_string();
             if is_state_tag(&tag) {
                 self.state = tag;
@@ -47,7 +46,7 @@ impl Task {
         });
 
         let mut props = IndexMap::new();
-        PROP_RE.find_iter(&self.body).for_each(|m| {
+        PROP_RE.find_iter(&self.raw).for_each(|m| {
             let captures = PROP_RE.captures(m.as_str()).unwrap();
             let key = captures.get(1).unwrap().as_str().to_string();
             let value = captures.get(2).unwrap().as_str().to_string();
@@ -60,10 +59,10 @@ impl Task {
         let line = line_strip(line);
         let mut t = Task {
             tags: vec![],
-            nest_level: 0,
             state: "".to_string(),
-            content: "".to_string(),
-            body: line.clone(), // raw line
+            raw: line.clone(),
+            title: "".to_string(),
+            body: String::new(),
             id: id.to_string(),
             parent: None,
             children: vec![],
@@ -71,21 +70,19 @@ impl Task {
         };
         t.tags_populate();
 
-        // derive content (cleaned from tags, properties, and bullets)
         let mut cleaned = TAG_RE.replace_all(&line, "").to_string();
         cleaned = PROP_RE.replace_all(&cleaned, "").to_string();
 
-        // remove bullet symbols
-        let mut content = cleaned.trim_start().to_string();
-        if let Some(stripped) = content
+        let mut title = cleaned.trim_start().to_string();
+        if let Some(stripped) = title
             .strip_prefix("* ")
-            .or_else(|| content.strip_prefix("- "))
-            .or_else(|| content.strip_prefix("+ "))
+            .or_else(|| title.strip_prefix("- "))
+            .or_else(|| title.strip_prefix("+ "))
         {
-            content = stripped.to_string();
+            title = stripped.to_string();
         }
 
-        t.content = content.trim().to_string();
+        t.title = title.trim().to_string();
         t
     }
 }
@@ -114,19 +111,55 @@ pub fn is_only_meta(line: &str) -> bool {
 }
 
 pub fn task_get_by_id(config: &AgendaConfig, task_id: &str) -> Task {
-    let task_ids = tasks_ids_get(config);
+    resolve_task_tree(config, task_id)
+}
 
-    let filename = task_filename_get(&task_id);
-    let full_path = config.vault_dir.join(&filename);
-    let lines = file_lines_get(full_path.to_string_lossy().as_ref());
-    task_get_from_lines(task_id, &lines, &task_ids).expect("HANDLE THIS - RETURN OPTION")
+pub fn compute_parent(task_id: &str, file_lines: &[String]) -> Option<String> {
+    let filename = task_filename_get(task_id);
+    let line_nr = task_line_get(task_id);
+    if line_nr == 0 || line_nr > file_lines.len() {
+        return None;
+    }
+
+    let current_line = &file_lines[line_nr - 1];
+    if !is_line_bullet(current_line) {
+        return None;
+    }
+
+    let current_indent = compute_line_indent(current_line);
+    let mut search_indent = current_indent;
+
+    for i in (0..(line_nr - 1)).rev() {
+        let line = &file_lines[i];
+
+        if is_line_heading(line) {
+            break;
+        }
+
+        if !is_line_bullet(line) {
+            continue;
+        }
+
+        let indent = compute_line_indent(line);
+
+        if indent < search_indent {
+            if has_state(line) {
+                return Some(format!("{}:{}", filename, i + 1));
+            } else {
+                search_indent = indent;
+                continue;
+            }
+        }
+    }
+
+    None
 }
 
 pub fn task_parent_get(config: &AgendaConfig, child_id: String) -> Option<Task> {
     let filename = task_filename_get(&child_id);
     let line_nr = task_line_get(&child_id);
-    let lines = file_lines_get(&filename);
-    let task_ids = tasks_ids_get(config);
+    let full_path = config.vault_dir.join(&filename);
+    let lines = file_lines_get(full_path.to_string_lossy().as_ref());
 
     let current_line = &lines[line_nr - 1];
     if !is_line_bullet(&current_line) {
@@ -151,9 +184,8 @@ pub fn task_parent_get(config: &AgendaConfig, child_id: String) -> Option<Task> 
         let indent = line.chars().take_while(|c| *c == ' ').count();
 
         if indent < search_indent {
-            let potential_parent_id = format!("{}:{}", filename, i + 1);
-
-            if task_ids.contains(&potential_parent_id) {
+            if has_state(&line) {
+                let potential_parent_id = format!("{}:{}", filename, i + 1);
                 return Some(task_get_by_id(config, &potential_parent_id));
             } else {
                 search_indent = indent;
@@ -163,6 +195,172 @@ pub fn task_parent_get(config: &AgendaConfig, child_id: String) -> Option<Task> 
     }
 
     None
+}
+
+pub fn compute_line_indent(line: &str) -> usize {
+    let mut indent = 0;
+    for c in line.chars() {
+        if c == ' ' {
+            indent += 1;
+        } else if c == '\t' {
+            indent += 2; // TODO: make tab width configurable
+        } else {
+            break;
+        }
+    }
+    indent
+}
+
+pub fn parse_task_body(task_id: &str, file_lines: &[String]) -> String {
+    let line_nr = task_line_get(task_id);
+    if line_nr == 0 || line_nr > file_lines.len() {
+        return String::new();
+    }
+
+    let task_line = &file_lines[line_nr - 1];
+    let task_indent = compute_line_indent(task_line);
+
+    let mut raw_lines: Vec<(usize, &String)> = Vec::new();
+    let mut i = line_nr;
+
+    while i < file_lines.len() {
+        let line = &file_lines[i];
+        let line_indent = compute_line_indent(line);
+
+        if line_indent <= task_indent {
+            break;
+        }
+
+        raw_lines.push((line_indent, line));
+        i += 1;
+    }
+
+    if raw_lines.is_empty() {
+        return String::new();
+    }
+
+    let min_indent = raw_lines.iter().map(|(ind, _)| *ind).min().unwrap_or(0);
+
+    raw_lines
+        .into_iter()
+        .map(|(_, line)| {
+            if min_indent > 0 && line.len() >= min_indent {
+                line[min_indent..].to_string()
+            } else {
+                line.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn resolve_task_tree(config: &AgendaConfig, task_id: &str) -> Task {
+    let filename = task_filename_get(task_id);
+    let full_path = config.vault_dir.join(&filename);
+    let lines = file_lines_get(full_path.to_string_lossy().as_ref());
+    let line_nr = task_line_get(task_id);
+
+    if line_nr == 0 || line_nr > lines.len() {
+        return Task::from_string("", task_id);
+    }
+
+    let task_line = &lines[line_nr - 1];
+    let mut task = Task::from_string(task_line, task_id);
+    task.body = parse_task_body(task_id, &lines);
+    task.parent = compute_parent(task_id, &lines);
+
+    let task_indent = compute_line_indent(task_line);
+    let mut children = Vec::new();
+    let mut i = line_nr; // 0-based, starts after task line
+
+    while i < lines.len() {
+        let line = &lines[i];
+        let line_indent = compute_line_indent(line);
+
+        if line_indent <= task_indent {
+            break;
+        }
+
+        let trimmed = line.trim();
+        let is_bullet = trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ");
+
+        if is_bullet && has_state(line) {
+            let child_id = format!("{}:{}", filename, i + 1);
+            let mut child = resolve_task_tree(config, &child_id);
+            child.parent = Some(task.id.clone());
+            children.push(child);
+
+            // skip past child's subtree
+            let child_indent = line_indent;
+            i += 1;
+            while i < lines.len() {
+                let next_indent = compute_line_indent(&lines[i]);
+                if next_indent <= child_indent {
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    task.children = children;
+    task
+}
+
+pub fn task_get_direct_children(config: &AgendaConfig, parent_id: &str) -> Vec<Task> {
+    let filename = task_filename_get(parent_id);
+    let full_path = config.vault_dir.join(&filename);
+    let line_nr = task_line_get(parent_id);
+    let lines = file_lines_get(full_path.to_string_lossy().as_ref());
+
+    if line_nr == 0 || line_nr > lines.len() {
+        return vec![];
+    }
+
+    let parent_line = &lines[line_nr - 1];
+    let parent_indent = compute_line_indent(parent_line);
+
+    let mut children = Vec::new();
+    let mut i = line_nr;
+
+    while i < lines.len() {
+        let line = &lines[i];
+        let line_indent = compute_line_indent(line);
+
+        if line_indent <= parent_indent {
+            break;
+        }
+
+        let trimmed = line.trim();
+        let is_bullet = trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ");
+
+        if is_bullet && has_state(line) {
+            let child_id = format!("{}:{}", filename, i + 1);
+            let mut child = Task::from_string(line, &child_id);
+            child.parent = Some(parent_id.to_string());
+            children.push(child);
+
+            let child_indent = line_indent;
+            i += 1;
+            while i < lines.len() {
+                let next_indent = compute_line_indent(&lines[i]);
+                if next_indent <= child_indent {
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    children
 }
 
 pub fn flatten_and_collect<'a>(tasks: &'a [Task]) -> (Vec<&'a Task>, HashSet<&'a str>) {
@@ -179,44 +377,6 @@ pub fn flatten_and_collect<'a>(tasks: &'a [Task]) -> (Vec<&'a Task>, HashSet<&'a
     }
 
     (flat, child_ids)
-}
-
-pub fn tasks_group_date(tasks: &[Task]) -> IndexMap<String, Vec<&Task>> {
-    group_by(tasks, |task| {
-        task.properties
-            .get("scheduled")
-            .map(|date| date.split('T').next().unwrap_or(date).to_string())
-    })
-}
-
-pub fn tasks_group_tag(tasks: &[Task]) -> IndexMap<String, Vec<&Task>> {
-    use crate::utils::group_by_multi;
-    group_by_multi(tasks, |task| {
-        if task.tags.is_empty() {
-            vec!["NO TAG".to_string()]
-        } else {
-            task.tags.clone()
-        }
-    })
-}
-
-pub fn tasks_group_by_date_and_tag(
-    tasks: &[Task],
-) -> (IndexMap<String, Vec<&Task>>, IndexMap<String, Vec<&Task>>) {
-    let grouped_date = tasks_group_date(tasks);
-    let grouped_tag = tasks_group_tag(tasks);
-    (grouped_date, grouped_tag)
-}
-
-pub fn tasks_group_by_property<'a>(
-    tasks: &'a [Task],
-    property: &str,
-) -> IndexMap<String, Vec<&'a Task>> {
-    group_by(tasks, |task| {
-        task.properties
-            .get(property)
-            .map(|v| v.split('T').next().unwrap_or(v.as_str()).to_string())
-    })
 }
 
 pub fn task_filename_get(task_id: &str) -> String {
@@ -255,69 +415,15 @@ fn is_line_heading(line: &str) -> bool {
 pub fn task_get_from_lines(
     task_id: &str,
     file_lines: &Vec<String>,
-    task_ids: &HashSet<String>,
+    _task_ids: &HashSet<String>,
 ) -> Option<Task> {
-    fn aux(
-        task_id: &str,
-        file_lines: &Vec<String>,
-        task_ids: &HashSet<String>,
-        skip_set: &mut HashSet<String>,
-    ) -> Option<Task> {
-        if skip_set.contains(task_id) {
-            return None;
-        }
-
-        skip_set.insert(task_id.to_string());
-
-        let line_nr = task_line_get(task_id);
-        let line = file_lines[line_nr - 1].clone();
-        let mut root = Task::from_string(&line, task_id);
-
-        let can_have_children = is_line_bullet(&line);
-        if can_have_children {
-            let current_indent = line.chars().take_while(|c| *c == ' ').count();
-            let mut i = line_nr;
-
-            while i < file_lines.len() {
-                let next_line = &file_lines[i];
-
-                if is_line_heading(&next_line) {
-                    break;
-                }
-
-                if !is_line_bullet(&next_line) {
-                    i += 1;
-                    continue;
-                }
-
-                let next_indent = next_line.chars().take_while(|c| *c == ' ').count();
-                if next_indent <= current_indent {
-                    break;
-                }
-
-                let potential_child_id = format!("{}:{}", task_filename_get(task_id), i + 1);
-                if task_ids.contains(&potential_child_id) {
-                    if let Some(mut child) =
-                        aux(&potential_child_id, file_lines, task_ids, skip_set)
-                    {
-                        child.parent = Some(root.id.clone());
-                        root.children.push(child);
-                    }
-                }
-
-                i += 1;
-            }
-        }
-
-        Some(root)
+    let line_nr = task_line_get(task_id);
+    if line_nr == 0 || line_nr > file_lines.len() {
+        return None;
     }
-
-    let mut skip_set = HashSet::new();
-    let mut task_ids_set = HashSet::new();
-    task_ids.iter().for_each(|id| {
-        task_ids_set.insert(id.clone());
-    });
-    aux(task_id, file_lines, &task_ids_set, &mut skip_set)
+    let line = &file_lines[line_nr - 1];
+    let task = Task::from_string(line, task_id);
+    Some(task)
 }
 
 pub fn tasks_get(config: &AgendaConfig) -> Vec<Task> {
@@ -410,19 +516,17 @@ pub fn tasks_filter_by_states_included(tasks: &[Task], include_states: &[String]
         .collect()
 }
 
-pub fn tasks_filter_by_content(tasks: &[Task], query: &str) -> Vec<Task> {
+pub fn tasks_filter_by_title(tasks: &[Task], query: &str) -> Vec<Task> {
     let query_lower = query.to_lowercase();
     tasks
         .iter()
-        .filter(|t| t.content.to_lowercase().contains(&query_lower))
+        .filter(|t| t.title.to_lowercase().contains(&query_lower))
         .cloned()
         .collect()
 }
 
 pub fn tasks_ids_get(config: &AgendaConfig) -> HashSet<String> {
-    let mut exclude_set = HashSet::new();
-    exclude_set.insert("DONE".to_string());
-    exclude_set.insert("CANCELLED".to_string());
+    let exclude_set: HashSet<String> = HashSet::new();
 
     let rg_result = tasks_grep(config, Some(&exclude_set));
     let rg_result = match rg_result {
@@ -460,7 +564,7 @@ pub fn task_line_set(config: &AgendaConfig, id: &str, line: &str) -> String {
 pub fn task_set_fields(
     config: &AgendaConfig,
     task_id: &str,
-    content: Option<&str>,
+    title: Option<&str>,
     state: Option<&str>,
     properties: Option<&std::collections::HashMap<String, String>>,
     tags: Option<&[String]>,
@@ -498,8 +602,8 @@ pub fn task_set_fields(
 
     let mut task = Task::from_string(original_line, task_id);
 
-    if let Some(c) = content {
-        task.content = c.to_string();
+    if let Some(c) = title {
+        task.title = c.to_string();
     }
 
     if let Some(s) = state {
@@ -521,9 +625,9 @@ pub fn task_set_fields(
     }
 
     let mut new_line = if indent.is_empty() {
-        format!("{} #{} {}", bullet, task.state, task.content)
+        format!("{} #{} {}", bullet, task.state, task.title)
     } else {
-        format!("{}{} #{} {}", indent, bullet, task.state, task.content)
+        format!("{}{} #{} {}", indent, bullet, task.state, task.title)
     };
 
     let mut sorted_keys: Vec<&String> = task.properties.keys().collect();
@@ -547,11 +651,11 @@ pub fn task_set_fields(
         writeln!(file, "{}", l).map_err(|e| e.to_string())?;
     }
 
-    task.body = new_line;
+    task.raw = new_line;
     Ok(task)
 }
 
-pub fn task_add(config: &AgendaConfig, content: &str, parent: Option<&str>) {
+pub fn task_add(config: &AgendaConfig, title: &str, parent: Option<&str>) {
     if let Some(parent_id) = parent {
         let filename = task_filename_get(parent_id);
         let lines = file_lines_get(&filename);
@@ -562,7 +666,7 @@ pub fn task_add(config: &AgendaConfig, content: &str, parent: Option<&str>) {
         let parent_indent = lines[parent_idx].chars().take_while(|c| *c == ' ').count();
         let subtask_indent = parent_indent + 2;
 
-        let line_to_insert = format!("{}* #TODO {}", " ".repeat(subtask_indent), content);
+        let line_to_insert = format!("{}* #TODO {}", " ".repeat(subtask_indent), title);
 
         let mut insert_idx = lines.len();
         for i in (parent_idx + 1)..lines.len() {
@@ -586,7 +690,7 @@ pub fn task_add(config: &AgendaConfig, content: &str, parent: Option<&str>) {
         file_line_insert(&filename, Some(insert_idx + 1), &line_to_insert)
             .expect("failed to add subtask");
     } else {
-        let line_to_insert = format!("* #TODO {}", content);
+        let line_to_insert = format!("* #TODO {}", title);
         let agenda_file = config.default_file_string();
         file_line_insert(&agenda_file, None, &line_to_insert).expect("failed to add task");
     }
@@ -696,7 +800,7 @@ pub fn task_change_property(
 
 pub fn task_capture(
     config: &AgendaConfig,
-    task_content: &str,
+    task_title: &str,
     target: &str,
     state: Option<&str>,
     properties: &std::collections::HashMap<String, String>,
@@ -715,7 +819,7 @@ pub fn task_capture(
         "TODO".to_string()
     };
 
-    let mut task_line = format!("* #{} {}", resolved_state, task_content);
+    let mut task_line = format!("* #{} {}", resolved_state, task_title);
 
     let mut sorted_keys: Vec<&String> = properties.keys().collect();
     sorted_keys.sort();
@@ -832,9 +936,117 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_line_indent_spaces() {
+        assert_eq!(compute_line_indent("  hello"), 2);
+        assert_eq!(compute_line_indent("    hello"), 4);
+        assert_eq!(compute_line_indent("hello"), 0);
+    }
+
+    #[test]
+    fn test_compute_line_indent_tabs() {
+        assert_eq!(compute_line_indent("\thello"), 2);
+        assert_eq!(compute_line_indent("\t\thello"), 4);
+    }
+
+    #[test]
+    fn test_compute_line_indent_mixed() {
+        assert_eq!(compute_line_indent(" \thello"), 3);
+    }
+
+    #[test]
+    fn test_parse_task_body_single_child() {
+        let lines = vec![
+            "- Parent #TODO".to_string(),
+            "  - Child #DONE".to_string(),
+            "- Sibling #TODO".to_string(),
+        ];
+        let body = parse_task_body("test.md:1", &lines);
+        assert_eq!(body, "- Child #DONE");
+    }
+
+    #[test]
+    fn test_parse_task_body_multiline_body() {
+        let lines = vec![
+            "- Parent #TODO".to_string(),
+            "  - Child #DONE".to_string(),
+            "  Some note text".to_string(),
+            "  > A quote".to_string(),
+            "- Sibling #TODO".to_string(),
+        ];
+        let body = parse_task_body("test.md:1", &lines);
+        assert_eq!(body, "- Child #DONE\nSome note text\n> A quote");
+    }
+
+    #[test]
+    fn test_parse_task_body_stops_at_same_indent() {
+        let lines = vec![
+            "- Parent #TODO".to_string(),
+            "  - Child #DONE".to_string(),
+            "- Sibling #TODO".to_string(),
+        ];
+        let body = parse_task_body("test.md:1", &lines);
+        assert_eq!(body, "- Child #DONE");
+    }
+
+    #[test]
+    fn test_parse_task_body_stops_at_less_indent() {
+        let lines = vec![
+            "  - Indented parent #TODO".to_string(),
+            "    - Child #DONE".to_string(),
+            "- Root task #TODO".to_string(),
+        ];
+        let body = parse_task_body("test.md:1", &lines);
+        assert_eq!(body, "- Child #DONE");
+    }
+
+    #[test]
+    fn test_parse_task_body_no_body() {
+        let lines = vec![
+            "- Parent #TODO".to_string(),
+            "- Sibling #TODO".to_string(),
+        ];
+        let body = parse_task_body("test.md:1", &lines);
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn test_parse_task_body_end_of_file() {
+        let lines = vec![
+            "- Parent #TODO".to_string(),
+            "  - Child #DONE".to_string(),
+        ];
+        let body = parse_task_body("test.md:1", &lines);
+        assert_eq!(body, "- Child #DONE");
+    }
+
+    #[test]
+    fn test_parse_task_body_preserves_nested_indent() {
+        let lines = vec![
+            "- Parent #TODO".to_string(),
+            "  - Child #DONE".to_string(),
+            "    - Grandchild #TODO".to_string(),
+            "- Sibling #TODO".to_string(),
+        ];
+        let body = parse_task_body("test.md:1", &lines);
+        assert_eq!(body, "- Child #DONE\n  - Grandchild #TODO");
+    }
+
+    #[test]
+    fn test_parse_task_body_indented_task() {
+        let lines = vec![
+            "  - Parent #TODO".to_string(),
+            "    - Child #DONE".to_string(),
+            "    Some note".to_string(),
+            "- Root #TODO".to_string(),
+        ];
+        let body = parse_task_body("test.md:1", &lines);
+        assert_eq!(body, "- Child #DONE\nSome note");
+    }
+
+    #[test]
     fn test_task_from_string_basic() {
         let task = Task::from_string("* Buy milk #TODO @priority(1)", "test.md:1");
-        assert_eq!(task.content, "Buy milk");
+        assert_eq!(task.title, "Buy milk");
         assert_eq!(task.state, "TODO");
         assert_eq!(task.id, "test.md:1");
         assert!(task.tags.is_empty());
@@ -844,7 +1056,7 @@ mod tests {
     #[test]
     fn test_task_from_string_with_tags() {
         let task = Task::from_string("* Fix bug #bug #high-priority", "test.md:2");
-        assert_eq!(task.content, "Fix bug");
+        assert_eq!(task.title, "Fix bug");
         assert!(task.state.is_empty());
         assert!(task.tags.contains(&"bug".to_string()));
         assert!(task.tags.contains(&"high-priority".to_string()));
@@ -853,16 +1065,16 @@ mod tests {
     #[test]
     fn test_task_from_string_strips_bullet() {
         let task = Task::from_string("- Task with dash", "test.md:1");
-        assert_eq!(task.content, "Task with dash");
+        assert_eq!(task.title, "Task with dash");
 
         let task2 = Task::from_string("+ Task with plus", "test.md:2");
-        assert_eq!(task2.content, "Task with plus");
+        assert_eq!(task2.title, "Task with plus");
     }
 
     #[test]
     fn test_task_from_string_strips_heading() {
         let task = Task::from_string("# Heading line #TODO", "test.md:1");
-        assert_eq!(task.content, "Heading line");
+        assert_eq!(task.title, "Heading line");
     }
 
     #[test]
@@ -926,397 +1138,36 @@ mod tests {
     }
 
     #[test]
-    fn test_tasks_group_date_groups_by_date() {
-        let tasks = vec![
-            Task {
-                content: "Task 1".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task 1 #TODO @scheduled(2024-01-15)".to_string(),
-                id: "test.md:1".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::from([("scheduled".to_string(), "2024-01-15".to_string())]),
-            },
-            Task {
-                content: "Task 2".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task 2 #TODO @scheduled(2024-01-15)".to_string(),
-                id: "test.md:2".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::from([(
-                    "scheduled".to_string(),
-                    "2024-01-15T10:00".to_string(),
-                )]),
-            },
-            Task {
-                content: "Task 3".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task 3 #TODO @scheduled(2024-01-20)".to_string(),
-                id: "test.md:3".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::from([("scheduled".to_string(), "2024-01-20".to_string())]),
-            },
-            Task {
-                content: "Task no date".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task no date #TODO".to_string(),
-                id: "test.md:4".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::new(),
-            },
-        ];
-
-        let grouped = tasks_group_date(&tasks);
-
-        assert!(grouped.contains_key("2024-01-15"));
-        assert!(grouped.contains_key("2024-01-20"));
-        assert_eq!(grouped["2024-01-15"].len(), 2);
-        assert_eq!(grouped["2024-01-20"].len(), 1);
-    }
-
-    #[test]
-    fn test_tasks_group_date_with_children() {
-        let child = Task {
-            content: "Child task".to_string(),
-            state: "TODO".to_string(),
-            nest_level: 1,
-            tags: vec![],
-            body: "  - Child #TODO @scheduled(2024-02-01)".to_string(),
-            id: "test.md:2".to_string(),
-            parent: Some("test.md:1".to_string()),
-            children: vec![],
-            properties: IndexMap::from([("scheduled".to_string(), "2024-02-01".to_string())]),
-        };
-
-        let tasks = vec![Task {
-            content: "Parent task".to_string(),
-            state: "TODO".to_string(),
-            nest_level: 0,
-            tags: vec![],
-            body: "* Parent #TODO @scheduled(2024-01-15)".to_string(),
-            id: "test.md:1".to_string(),
-            parent: None,
-            children: vec![child],
-            properties: IndexMap::from([("scheduled".to_string(), "2024-01-15".to_string())]),
-        }];
-
-        let grouped = tasks_group_date(&tasks);
-
-        assert!(grouped.contains_key("2024-01-15"));
-        assert!(grouped.contains_key("2024-02-01"));
-    }
-
-    #[test]
-    fn test_tasks_group_tag_groups_by_tag() {
-        let tasks = vec![
-            Task {
-                content: "Task 1".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec!["bug".to_string(), "urgent".to_string()],
-                body: "* Task 1 #TODO #bug #urgent".to_string(),
-                id: "test.md:1".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::new(),
-            },
-            Task {
-                content: "Task 2".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec!["bug".to_string()],
-                body: "* Task 2 #TODO #bug".to_string(),
-                id: "test.md:2".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::new(),
-            },
-            Task {
-                content: "Task 3".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task 3 #TODO".to_string(),
-                id: "test.md:3".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::new(),
-            },
-        ];
-
-        let grouped = tasks_group_tag(&tasks);
-
-        assert!(grouped.contains_key("bug"));
-        assert!(grouped.contains_key("urgent"));
-        assert!(grouped.contains_key("NO TAG"));
-        assert_eq!(grouped["bug"].len(), 2);
-        assert_eq!(grouped["urgent"].len(), 1);
-        assert_eq!(grouped["NO TAG"].len(), 1);
-    }
-
-    #[test]
-    fn test_tasks_group_tag_with_children() {
-        let child = Task {
-            content: "Child".to_string(),
-            state: "TODO".to_string(),
-            nest_level: 1,
-            tags: vec!["feature".to_string()],
-            body: "  - Child #TODO #feature".to_string(),
-            id: "test.md:2".to_string(),
-            parent: Some("test.md:1".to_string()),
-            children: vec![],
-            properties: IndexMap::new(),
-        };
-
-        let tasks = vec![Task {
-            content: "Parent".to_string(),
-            state: "TODO".to_string(),
-            nest_level: 0,
-            tags: vec!["bug".to_string()],
-            body: "* Parent #TODO #bug".to_string(),
-            id: "test.md:1".to_string(),
-            parent: None,
-            children: vec![child],
-            properties: IndexMap::new(),
-        }];
-
-        let grouped = tasks_group_tag(&tasks);
-
-        assert!(grouped.contains_key("bug"));
-        assert!(grouped.contains_key("feature"));
-    }
-
-    #[test]
-    fn test_tasks_group_by_date_and_tag_combined() {
-        let tasks = vec![
-            Task {
-                content: "Task 1".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec!["bug".to_string()],
-                body: "* Task 1 #TODO #bug @scheduled(2024-01-15)".to_string(),
-                id: "test.md:1".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::from([("scheduled".to_string(), "2024-01-15".to_string())]),
-            },
-            Task {
-                content: "Task 2".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec!["feature".to_string()],
-                body: "* Task 2 #TODO #feature".to_string(),
-                id: "test.md:2".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::new(),
-            },
-        ];
-
-        let (grouped_date, grouped_tag) = tasks_group_by_date_and_tag(&tasks);
-
-        assert!(grouped_date.contains_key("2024-01-15"));
-        assert_eq!(grouped_date["2024-01-15"].len(), 1);
-
-        assert!(grouped_tag.contains_key("bug"));
-        assert!(grouped_tag.contains_key("feature"));
-        assert_eq!(grouped_tag["bug"].len(), 1);
-        assert_eq!(grouped_tag["feature"].len(), 1);
-    }
-
-    #[test]
-    fn test_tasks_group_by_property() {
-        let tasks = vec![
-            Task {
-                content: "Task 1".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task 1 #TODO @priority(1)".to_string(),
-                id: "test.md:1".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::from([("priority".to_string(), "1".to_string())]),
-            },
-            Task {
-                content: "Task 2".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task 2 #TODO @priority(2)".to_string(),
-                id: "test.md:2".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::from([("priority".to_string(), "2".to_string())]),
-            },
-            Task {
-                content: "Task 3".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task 3 #TODO".to_string(),
-                id: "test.md:3".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::new(),
-            },
-        ];
-
-        let grouped = tasks_group_by_property(&tasks, "priority");
-
-        assert!(grouped.contains_key("1"));
-        assert!(grouped.contains_key("2"));
-        assert!(!grouped.contains_key("3"));
-        assert_eq!(grouped["1"].len(), 1);
-        assert_eq!(grouped["2"].len(), 1);
-        assert_eq!(grouped["1"][0].content, "Task 1");
-    }
-
-    #[test]
-    fn test_tasks_group_by_property_with_children() {
-        let child = Task {
-            content: "Child task".to_string(),
-            state: "TODO".to_string(),
-            nest_level: 1,
-            tags: vec![],
-            body: "  - Child #TODO @scheduled(2024-02-01)".to_string(),
-            id: "test.md:2".to_string(),
-            parent: Some("test.md:1".to_string()),
-            children: vec![],
-            properties: IndexMap::from([("scheduled".to_string(), "2024-02-01".to_string())]),
-        };
-
-        let tasks = vec![Task {
-            content: "Parent task".to_string(),
-            state: "TODO".to_string(),
-            nest_level: 0,
-            tags: vec![],
-            body: "* Parent #TODO @scheduled(2024-01-15)".to_string(),
-            id: "test.md:1".to_string(),
-            parent: None,
-            children: vec![child],
-            properties: IndexMap::from([("scheduled".to_string(), "2024-01-15".to_string())]),
-        }];
-
-        let grouped = tasks_group_by_property(&tasks, "scheduled");
-
-        assert!(grouped.contains_key("2024-01-15"));
-        assert!(grouped.contains_key("2024-02-01"));
-    }
-
-    #[test]
-    fn test_tasks_group_by_property_skips_missing() {
-        let tasks = vec![
-            Task {
-                content: "Task with scheduled".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task #TODO @scheduled(2024-01-15)".to_string(),
-                id: "test.md:1".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::from([("scheduled".to_string(), "2024-01-15".to_string())]),
-            },
-            Task {
-                content: "Task without scheduled".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task no prop #TODO".to_string(),
-                id: "test.md:2".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::new(),
-            },
-        ];
-
-        let grouped = tasks_group_by_property(&tasks, "scheduled");
-
-        assert_eq!(grouped.len(), 1);
-        assert!(grouped.contains_key("2024-01-15"));
-        assert_eq!(grouped["2024-01-15"].len(), 1);
-    }
-
-    #[test]
-    fn test_tasks_group_by_property_with_datetime() {
-        let tasks = vec![
-            Task {
-                content: "Task with date only".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task #TODO @scheduled(2024-01-15)".to_string(),
-                id: "test.md:1".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::from([("scheduled".to_string(), "2024-01-15".to_string())]),
-            },
-            Task {
-                content: "Task with datetime".to_string(),
-                state: "TODO".to_string(),
-                nest_level: 0,
-                tags: vec![],
-                body: "* Task #TODO @scheduled(2024-01-15T09:00)".to_string(),
-                id: "test.md:2".to_string(),
-                parent: None,
-                children: vec![],
-                properties: IndexMap::from([(
-                    "scheduled".to_string(),
-                    "2024-01-15T09:00".to_string(),
-                )]),
-            },
-        ];
-
-        let grouped = tasks_group_by_property(&tasks, "scheduled");
-
-        assert_eq!(grouped.len(), 1);
-        assert!(grouped.contains_key("2024-01-15"));
-        assert_eq!(grouped["2024-01-15"].len(), 2);
-    }
-
-    #[test]
     fn test_tasks_filter_by_tag() {
         let tasks = vec![
             Task {
-                content: "Task 1".to_string(),
+                title: "Task 1".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec!["bug".to_string(), "urgent".to_string()],
-                body: "* Task 1 #TODO #bug #urgent".to_string(),
+                raw: "* Task 1 #TODO #bug #urgent".to_string(),
+                body: String::new(),
                 id: "test.md:1".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Task 2".to_string(),
+                title: "Task 2".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec!["feature".to_string()],
-                body: "* Task 2 #TODO #feature".to_string(),
+                raw: "* Task 2 #TODO #feature".to_string(),
+                body: String::new(),
                 id: "test.md:2".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Task 3".to_string(),
+                title: "Task 3".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task 3 #TODO".to_string(),
+                raw: "* Task 3 #TODO".to_string(),
+                body: String::new(),
                 id: "test.md:3".to_string(),
                 parent: None,
                 children: vec![],
@@ -1326,11 +1177,11 @@ mod tests {
 
         let filtered = tasks_filter_by_tag(&tasks, "bug");
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].content, "Task 1");
+        assert_eq!(filtered[0].title, "Task 1");
 
         let filtered_feature = tasks_filter_by_tag(&tasks, "feature");
         assert_eq!(filtered_feature.len(), 1);
-        assert_eq!(filtered_feature[0].content, "Task 2");
+        assert_eq!(filtered_feature[0].title, "Task 2");
 
         let filtered_no_tag = tasks_filter_by_tag(&tasks, "nonexistent");
         assert!(filtered_no_tag.is_empty());
@@ -1340,33 +1191,33 @@ mod tests {
     fn test_tasks_filter_by_property() {
         let tasks = vec![
             Task {
-                content: "Task 1".to_string(),
+                title: "Task 1".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task 1 #TODO @scheduled(2024-01-15)".to_string(),
+                raw: "* Task 1 #TODO @scheduled(2024-01-15)".to_string(),
+                body: String::new(),
                 id: "test.md:1".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::from([("scheduled".to_string(), "2024-01-15".to_string())]),
             },
             Task {
-                content: "Task 2".to_string(),
+                title: "Task 2".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task 2 #TODO @priority(1)".to_string(),
+                raw: "* Task 2 #TODO @priority(1)".to_string(),
+                body: String::new(),
                 id: "test.md:2".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::from([("priority".to_string(), "1".to_string())]),
             },
             Task {
-                content: "Task 3 with datetime".to_string(),
+                title: "Task 3 with datetime".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task 3 #TODO @scheduled(2026-04-09T14:00)".to_string(),
+                raw: "* Task 3 #TODO @scheduled(2026-04-09T14:00)".to_string(),
+                body: String::new(),
                 id: "test.md:3".to_string(),
                 parent: None,
                 children: vec![],
@@ -1376,11 +1227,11 @@ mod tests {
                 )]),
             },
             Task {
-                content: "Task 4 with date only".to_string(),
+                title: "Task 4 with date only".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task 4 #TODO @scheduled(2026-04-09)".to_string(),
+                raw: "* Task 4 #TODO @scheduled(2026-04-09)".to_string(),
+                body: String::new(),
                 id: "test.md:4".to_string(),
                 parent: None,
                 children: vec![],
@@ -1390,15 +1241,15 @@ mod tests {
 
         let filtered = tasks_filter_by_property(&tasks, "scheduled", None);
         assert_eq!(filtered.len(), 3);
-        assert!(filtered.iter().any(|t| t.content == "Task 1"));
-        assert!(filtered.iter().any(|t| t.content == "Task 3 with datetime"));
+        assert!(filtered.iter().any(|t| t.title == "Task 1"));
+        assert!(filtered.iter().any(|t| t.title == "Task 3 with datetime"));
         assert!(filtered
             .iter()
-            .any(|t| t.content == "Task 4 with date only"));
+            .any(|t| t.title == "Task 4 with date only"));
 
         let filtered_with_value = tasks_filter_by_property(&tasks, "scheduled", Some("2024-01-15"));
         assert_eq!(filtered_with_value.len(), 1);
-        assert_eq!(filtered_with_value[0].content, "Task 1");
+        assert_eq!(filtered_with_value[0].title, "Task 1");
 
         let filtered_wrong_value =
             tasks_filter_by_property(&tasks, "scheduled", Some("2025-01-01"));
@@ -1409,14 +1260,14 @@ mod tests {
         assert_eq!(filtered_with_datetime_value.len(), 2);
         assert!(filtered_with_datetime_value
             .iter()
-            .any(|t| t.content == "Task 3 with datetime"));
+            .any(|t| t.title == "Task 3 with datetime"));
         assert!(filtered_with_datetime_value
             .iter()
-            .any(|t| t.content == "Task 4 with date only"));
+            .any(|t| t.title == "Task 4 with date only"));
 
         let filtered_priority = tasks_filter_by_property(&tasks, "priority", None);
         assert_eq!(filtered_priority.len(), 1);
-        assert_eq!(filtered_priority[0].content, "Task 2");
+        assert_eq!(filtered_priority[0].title, "Task 2");
 
         let filtered_none = tasks_filter_by_property(&tasks, "nonexistent", None);
         assert!(filtered_none.is_empty());
@@ -1426,44 +1277,44 @@ mod tests {
     fn test_tasks_filter_by_states() {
         let tasks = vec![
             Task {
-                content: "Task 1".to_string(),
+                title: "Task 1".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task 1 #TODO".to_string(),
+                raw: "* Task 1 #TODO".to_string(),
+                body: String::new(),
                 id: "test.md:1".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Task 2".to_string(),
+                title: "Task 2".to_string(),
                 state: "DONE".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task 2 #DONE".to_string(),
+                raw: "* Task 2 #DONE".to_string(),
+                body: String::new(),
                 id: "test.md:2".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Task 3".to_string(),
+                title: "Task 3".to_string(),
                 state: "IN_PROGRESS".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task 3 #IN_PROGRESS".to_string(),
+                raw: "* Task 3 #IN_PROGRESS".to_string(),
+                body: String::new(),
                 id: "test.md:3".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Task 4".to_string(),
+                title: "Task 4".to_string(),
                 state: "CANCELLED".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task 4 #CANCELLED".to_string(),
+                raw: "* Task 4 #CANCELLED".to_string(),
+                body: String::new(),
                 id: "test.md:4".to_string(),
                 parent: None,
                 children: vec![],
@@ -1488,33 +1339,33 @@ mod tests {
     fn test_tasks_filter_combined() {
         let tasks = vec![
             Task {
-                content: "Bug task".to_string(),
+                title: "Bug task".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec!["bug".to_string()],
-                body: "* Bug task #TODO #bug @priority(1)".to_string(),
+                raw: "* Bug task #TODO #bug @priority(1)".to_string(),
+                body: String::new(),
                 id: "test.md:1".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::from([("priority".to_string(), "1".to_string())]),
             },
             Task {
-                content: "Feature task".to_string(),
+                title: "Feature task".to_string(),
                 state: "DONE".to_string(),
-                nest_level: 0,
                 tags: vec!["feature".to_string()],
-                body: "* Feature task #DONE #feature @priority(2)".to_string(),
+                raw: "* Feature task #DONE #feature @priority(2)".to_string(),
+                body: String::new(),
                 id: "test.md:2".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::from([("priority".to_string(), "2".to_string())]),
             },
             Task {
-                content: "Another bug".to_string(),
+                title: "Another bug".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec!["bug".to_string()],
-                body: "* Another bug #TODO #bug".to_string(),
+                raw: "* Another bug #TODO #bug".to_string(),
+                body: String::new(),
                 id: "test.md:3".to_string(),
                 parent: None,
                 children: vec![],
@@ -1534,33 +1385,33 @@ mod tests {
     fn test_tasks_sort_by_state() {
         let mut tasks = vec![
             Task {
-                content: "Task A".to_string(),
+                title: "Task A".to_string(),
                 state: "DONE".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task A #DONE".to_string(),
+                raw: "* Task A #DONE".to_string(),
+                body: String::new(),
                 id: "test.md:1".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Task B".to_string(),
+                title: "Task B".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task B #TODO".to_string(),
+                raw: "* Task B #TODO".to_string(),
+                body: String::new(),
                 id: "test.md:2".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Task C".to_string(),
+                title: "Task C".to_string(),
                 state: "IN_PROGRESS".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task C #IN_PROGRESS".to_string(),
+                raw: "* Task C #IN_PROGRESS".to_string(),
+                body: String::new(),
                 id: "test.md:3".to_string(),
                 parent: None,
                 children: vec![],
@@ -1579,33 +1430,33 @@ mod tests {
     fn test_tasks_sort_by_priority_then_state() {
         let mut tasks = vec![
             Task {
-                content: "Task A".to_string(),
+                title: "Task A".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task A #TODO @priority(2)".to_string(),
+                raw: "* Task A #TODO @priority(2)".to_string(),
+                body: String::new(),
                 id: "test.md:1".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::from([("priority".to_string(), "2".to_string())]),
             },
             Task {
-                content: "Task B".to_string(),
+                title: "Task B".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task B #TODO @priority(1)".to_string(),
+                raw: "* Task B #TODO @priority(1)".to_string(),
+                body: String::new(),
                 id: "test.md:2".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::from([("priority".to_string(), "1".to_string())]),
             },
             Task {
-                content: "Task C".to_string(),
+                title: "Task C".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task C #TODO @priority(1)".to_string(),
+                raw: "* Task C #TODO @priority(1)".to_string(),
+                body: String::new(),
                 id: "test.md:3".to_string(),
                 parent: None,
                 children: vec![],
@@ -1624,22 +1475,22 @@ mod tests {
     fn test_tasks_sort_by_scheduled() {
         let mut tasks = vec![
             Task {
-                content: "Task A".to_string(),
+                title: "Task A".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task A #TODO @scheduled(2024-02-01)".to_string(),
+                raw: "* Task A #TODO @scheduled(2024-02-01)".to_string(),
+                body: String::new(),
                 id: "test.md:1".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::from([("scheduled".to_string(), "2024-02-01".to_string())]),
             },
             Task {
-                content: "Task B".to_string(),
+                title: "Task B".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task B #TODO @scheduled(2024-01-15)".to_string(),
+                raw: "* Task B #TODO @scheduled(2024-01-15)".to_string(),
+                body: String::new(),
                 id: "test.md:2".to_string(),
                 parent: None,
                 children: vec![],
@@ -1649,41 +1500,41 @@ mod tests {
 
         tasks_sort_by(&mut tasks, &["scheduled".to_string()]);
 
-        assert_eq!(tasks[0].content, "Task B");
-        assert_eq!(tasks[1].content, "Task A");
+        assert_eq!(tasks[0].title, "Task B");
+        assert_eq!(tasks[1].title, "Task A");
     }
 
     #[test]
-    fn test_tasks_filter_by_content() {
+    fn test_tasks_filter_by_title() {
         let tasks = vec![
             Task {
-                content: "Buy groceries".to_string(),
+                title: "Buy groceries".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec!["shopping".to_string()],
-                body: "* Buy groceries #TODO #shopping".to_string(),
+                raw: "* Buy groceries #TODO #shopping".to_string(),
+                body: String::new(),
                 id: "test.md:1".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Call mom".to_string(),
+                title: "Call mom".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Call mom #TODO".to_string(),
+                raw: "* Call mom #TODO".to_string(),
+                body: String::new(),
                 id: "test.md:2".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Buy milk".to_string(),
+                title: "Buy milk".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec!["shopping".to_string()],
-                body: "* Buy milk #TODO #shopping".to_string(),
+                raw: "* Buy milk #TODO #shopping".to_string(),
+                body: String::new(),
                 id: "test.md:3".to_string(),
                 parent: None,
                 children: vec![],
@@ -1691,14 +1542,14 @@ mod tests {
             },
         ];
 
-        let filtered = tasks_filter_by_content(&tasks, "buy");
+        let filtered = tasks_filter_by_title(&tasks, "buy");
         assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().all(|t| t.content.to_lowercase().contains("buy")));
+        assert!(filtered.iter().all(|t| t.title.to_lowercase().contains("buy")));
 
-        let filtered_case = tasks_filter_by_content(&tasks, "BUY");
+        let filtered_case = tasks_filter_by_title(&tasks, "BUY");
         assert_eq!(filtered_case.len(), 2);
 
-        let filtered_none = tasks_filter_by_content(&tasks, "xyz");
+        let filtered_none = tasks_filter_by_title(&tasks, "xyz");
         assert!(filtered_none.is_empty());
     }
 
@@ -1706,44 +1557,44 @@ mod tests {
     fn test_tasks_filter_multiple_criteria_and_logic() {
         let tasks = vec![
             Task {
-                content: "Task with bug and priority".to_string(),
+                title: "Task with bug and priority".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec!["bug".to_string()],
-                body: "* Task with bug and priority #TODO #bug @priority(high)".to_string(),
+                raw: "* Task with bug and priority #TODO #bug @priority(high)".to_string(),
+                body: String::new(),
                 id: "test.md:1".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::from([("priority".to_string(), "high".to_string())]),
             },
             Task {
-                content: "Task with bug only".to_string(),
+                title: "Task with bug only".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec!["bug".to_string()],
-                body: "* Task with bug only #TODO #bug".to_string(),
+                raw: "* Task with bug only #TODO #bug".to_string(),
+                body: String::new(),
                 id: "test.md:2".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::new(),
             },
             Task {
-                content: "Task with priority only".to_string(),
+                title: "Task with priority only".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Task with priority only #TODO @priority(high)".to_string(),
+                raw: "* Task with priority only #TODO @priority(high)".to_string(),
+                body: String::new(),
                 id: "test.md:3".to_string(),
                 parent: None,
                 children: vec![],
                 properties: IndexMap::from([("priority".to_string(), "high".to_string())]),
             },
             Task {
-                content: "Regular task".to_string(),
+                title: "Regular task".to_string(),
                 state: "TODO".to_string(),
-                nest_level: 0,
                 tags: vec![],
-                body: "* Regular task #TODO".to_string(),
+                raw: "* Regular task #TODO".to_string(),
+                body: String::new(),
                 id: "test.md:4".to_string(),
                 parent: None,
                 children: vec![],
@@ -1760,6 +1611,6 @@ mod tests {
         let filtered_and = tasks_filter_by_tag(&tasks, "bug");
         let filtered_and = tasks_filter_by_property(&filtered_and, "priority", Some("high"));
         assert_eq!(filtered_and.len(), 1);
-        assert_eq!(filtered_and[0].content, "Task with bug and priority");
+        assert_eq!(filtered_and[0].title, "Task with bug and priority");
     }
 }

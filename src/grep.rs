@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use crate::config::AgendaConfig;
 
-pub const TASK_STATES: &[&str] = &["TODO", "IN_PROGRESS", "DONE", "NEXT", "WAIT", "LATER"];
+pub const TASK_STATES: &[&str] = &["TODO", "IN_PROGRESS", "DONE", "NEXT", "WAIT", "LATER", "ARCHIVED"];
 
 pub fn task_state_next(current: &str) -> String {
     if let Some(index) = TASK_STATES.iter().position(|&s| s == current) {
@@ -31,7 +31,7 @@ pub fn task_state_prev(current: &str) -> String {
     }
 }
 
-fn pattern_get(excluded: Option<&HashSet<String>>) -> String {
+pub fn pattern_get(excluded: Option<&HashSet<String>>) -> String {
     TASK_STATES
         .iter()
         .filter(|state| {
@@ -46,7 +46,7 @@ fn pattern_get(excluded: Option<&HashSet<String>>) -> String {
         .join("|")
 }
 
-fn pattern_get_include(included: &HashSet<String>) -> String {
+pub fn pattern_get_include(included: &HashSet<String>) -> String {
     TASK_STATES
         .iter()
         .filter(|state| included.contains(**state))
@@ -253,6 +253,139 @@ pub fn tasks_grep_tag(
                             .any(|s| line.contains(&format!("#{}", s)));
 
                         if has_tag && has_valid_state && !has_excluded_state {
+                            return Some((
+                                *line_nr,
+                                format!("{}:{}:{}", filename, line_nr, content),
+                            ));
+                        }
+                    }
+                    None
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut filtered_lines: Vec<(usize, String)> = Vec::new();
+    for batch in results {
+        filtered_lines.extend(batch);
+    }
+
+    filtered_lines.sort_by_key(|(line_nr, _)| *line_nr);
+
+    let output = filtered_lines
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(output)
+}
+
+pub fn tasks_grep_multi_tag(
+    config: &AgendaConfig,
+    tags: &[String],
+    excluded: Option<&HashSet<String>>,
+) -> Result<String, Box<dyn Error>> {
+    let state_pattern = pattern_get(excluded);
+    let tag_patterns: Vec<String> = tags.iter().map(|t| format!("#{}", t)).collect();
+    let tag_part = tag_patterns.join("|");
+    let combined_pattern = format!("{}|{}", state_pattern, tag_part);
+    let vault_str = config.vault_dir_string();
+
+    let output = Command::new("rg")
+        .args(["-H", "-n", "--multiline", &combined_pattern, "."])
+        .current_dir(&vault_str)
+        .output()?;
+
+    let lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut lines_by_file: std::collections::HashMap<String, Vec<(usize, String)>> =
+        std::collections::HashMap::new();
+
+    for line in lines {
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() >= 2 {
+            if let Some(filename) = parts.first() {
+                let relative_name = if filename.starts_with("./") {
+                    &filename[2..]
+                } else {
+                    filename
+                };
+                if let Some(line_nr_str) = parts.get(1) {
+                    if let Ok(line_nr) = line_nr_str.parse::<usize>() {
+                        let content = parts.get(2).map(|s| s.to_string());
+                        lines_by_file
+                            .entry(relative_name.to_string())
+                            .or_default()
+                            .push((line_nr, content.unwrap_or_default()));
+                    }
+                }
+            }
+        }
+    }
+
+    let tasks_by_file: Vec<(String, Vec<(usize, String)>)> = lines_by_file.into_iter().collect();
+
+    let results: Vec<Vec<(usize, String)>> = tasks_by_file
+        .par_iter()
+        .map(|(filename, tasks)| {
+            let full_path = Path::new(&vault_str).join(filename);
+            let (backlink_start_line, file_content) =
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    let bl_start = content
+                        .lines()
+                        .enumerate()
+                        .find(|(_, l)| l.contains("<!-- BACKLINKS:START -->"))
+                        .map(|(i, _)| i + 1);
+                    (bl_start, Some(content))
+                } else {
+                    (None, None)
+                };
+
+            tasks
+                .iter()
+                .filter_map(|(line_nr, content)| {
+                    let include = match backlink_start_line {
+                        Some(bl_start) => *line_nr < bl_start,
+                        None => true,
+                    };
+                    if !include {
+                        return None;
+                    }
+
+                    let line_content = file_content
+                        .as_ref()
+                        .and_then(|c| c.lines().nth(*line_nr - 1));
+
+                    if let Some(line) = line_content {
+                        let has_any_tag = tag_patterns.iter().any(|tp| line.contains(tp.as_str()));
+
+                        let has_valid_state = TASK_STATES
+                            .iter()
+                            .filter(|s| {
+                                if let Some(ex) = excluded {
+                                    !ex.contains(**s)
+                                } else {
+                                    true
+                                }
+                            })
+                            .any(|s| line.contains(&format!("#{}", s)));
+
+                        let has_excluded_state = TASK_STATES
+                            .iter()
+                            .filter(|s| {
+                                if let Some(ex) = excluded {
+                                    ex.contains(**s)
+                                } else {
+                                    false
+                                }
+                            })
+                            .any(|s| line.contains(&format!("#{}", s)));
+
+                        if has_any_tag && has_valid_state && !has_excluded_state {
                             return Some((
                                 *line_nr,
                                 format!("{}:{}:{}", filename, line_nr, content),
@@ -506,18 +639,20 @@ mod tests {
         assert_eq!(task_state_next("DONE"), "NEXT");
         assert_eq!(task_state_next("NEXT"), "WAIT");
         assert_eq!(task_state_next("WAIT"), "LATER");
-        assert_eq!(task_state_next("LATER"), "TODO");
+        assert_eq!(task_state_next("LATER"), "ARCHIVED");
+        assert_eq!(task_state_next("ARCHIVED"), "TODO");
         assert_eq!(task_state_next("UNKNOWN"), "TODO");
     }
 
     #[test]
     fn test_task_state_prev() {
-        assert_eq!(task_state_prev("TODO"), "LATER");
-        assert_eq!(task_state_prev("IN_PROGRESS"), "TODO");
-        assert_eq!(task_state_prev("DONE"), "IN_PROGRESS");
-        assert_eq!(task_state_prev("NEXT"), "DONE");
-        assert_eq!(task_state_prev("WAIT"), "NEXT");
+        assert_eq!(task_state_prev("TODO"), "ARCHIVED");
+        assert_eq!(task_state_prev("ARCHIVED"), "LATER");
         assert_eq!(task_state_prev("LATER"), "WAIT");
+        assert_eq!(task_state_prev("WAIT"), "NEXT");
+        assert_eq!(task_state_prev("NEXT"), "DONE");
+        assert_eq!(task_state_prev("DONE"), "IN_PROGRESS");
+        assert_eq!(task_state_prev("IN_PROGRESS"), "TODO");
         assert_eq!(task_state_prev("UNKNOWN"), "TODO");
     }
 

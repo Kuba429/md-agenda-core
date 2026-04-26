@@ -1,6 +1,5 @@
 use crate::backlinks::run as run_backlinks;
 use crate::config::AgendaConfig;
-use crate::fs_utils::file_lines_get;
 use crate::grep::task_state_next;
 use crate::grep::task_state_prev;
 use crate::repository::MarkdownTaskRepository;
@@ -8,15 +7,13 @@ use crate::task::task_add;
 use crate::task::task_capture;
 use crate::task::task_change_property;
 use crate::task::task_change_state;
-use crate::task::task_parent_get;
 use crate::task::tasks_filter_by_property;
 use crate::task::tasks_filter_by_states;
 use crate::task::tasks_filter_by_states_included;
 use crate::task::tasks_filter_by_tag;
-use crate::task::tasks_filter_by_content;
+use crate::task::tasks_filter_by_title;
 use crate::task::{
-    task_filename_get, task_get_by_id, task_line_get, task_line_set, task_set_fields, tasks_get,
-    tasks_group_by_property, Task,
+    task_get_by_id, task_get_direct_children, task_line_set, task_set_fields, resolve_task_tree, Task,
 };
 use crate::task::{tasks_sort, tasks_sort_by};
 use clap::Parser;
@@ -39,8 +36,6 @@ pub struct Args {
 pub enum Commands {
     Get {
         #[arg(short, long)]
-        group: Option<String>,
-        #[arg(short, long)]
         task_id: Option<String>,
         #[arg(long)]
         next_state: Option<String>,
@@ -48,6 +43,8 @@ pub enum Commands {
         previous_state: Option<String>,
         #[arg(long)]
         parent_of: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
         #[arg(long)]
         tag: Option<String>,
         #[arg(long, num_args = 1..)]
@@ -59,11 +56,15 @@ pub enum Commands {
         #[arg(long, num_args = 1..)]
         sort: Option<Vec<String>>,
         #[arg(long)]
-        content: Option<String>,
+        title: Option<String>,
         #[arg(long)]
         include_children: bool,
         #[arg(long)]
         include_ancestors: bool,
+        #[arg(long, allow_hyphen_values = true)]
+        query: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        query_debug: Option<String>,
     },
     Set {
         #[arg(short, long)]
@@ -71,7 +72,7 @@ pub enum Commands {
         #[arg(short, long)]
         line: Option<String>,
         #[arg(short, long)]
-        content: Option<String>,
+        title: Option<String>,
         #[arg(short, long)]
         state: Option<String>,
         #[arg(long, num_args = 1..)]
@@ -85,7 +86,7 @@ pub enum Commands {
     },
     Add {
         #[arg(short, long)]
-        content: String,
+        title: String,
         #[arg(short, long)]
         task_id: Option<String>,
     },
@@ -103,7 +104,7 @@ pub enum Commands {
     },
     Capture {
         #[arg(short, long)]
-        content: String,
+        title: String,
         #[arg(short, long)]
         target: Option<String>,
         #[arg(short, long)]
@@ -125,198 +126,8 @@ fn get_vault_dir(args: &Args) -> PathBuf {
     }
 }
 
-fn get_task_children(config: &AgendaConfig, task_id: &str) -> Vec<Task> {
-    let filename = task_filename_get(task_id);
-    let full_path = config.vault_dir.join(&filename);
-    let line_nr = task_line_get(task_id);
-    let lines = file_lines_get(full_path.to_string_lossy().as_ref());
-
-    if line_nr == 0 || line_nr > lines.len() {
-        return vec![];
-    }
-
-    let current_line = &lines[line_nr - 1];
-    let current_indent = current_line.chars().take_while(|c| *c == ' ').count();
-
-    let mut children = vec![];
-    let mut i = line_nr;
-
-    while i < lines.len() {
-        let next_line = &lines[i];
-        let trimmed = next_line.trim();
-
-        if trimmed.starts_with('#') {
-            break;
-        }
-
-        let next_indent = next_line.chars().take_while(|c| *c == ' ').count();
-        if next_indent <= current_indent {
-            break;
-        }
-
-        let is_bullet =
-            trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ");
-        let has_state = trimmed.contains("#TODO")
-            || trimmed.contains("#IN_PROGRESS")
-            || trimmed.contains("#DONE")
-            || trimmed.contains("#NEXT")
-            || trimmed.contains("#WAIT")
-            || trimmed.contains("#LATER");
-
-        if is_bullet && has_state {
-            let child_id = format!("{}:{}", filename, i + 1);
-            let child = Task::from_string(next_line, &child_id);
-            let grandchildren = get_task_children(config, &child_id);
-            children.push(Task {
-                children: grandchildren,
-                ..child
-            });
-
-            let child_indent = next_indent;
-            i += 1;
-            while i < lines.len() {
-                let line = &lines[i];
-                if line.trim().starts_with('#') {
-                    break;
-                }
-                if line.chars().take_while(|c| *c == ' ').count() <= child_indent {
-                    break;
-                }
-                i += 1;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    children
-}
-
-pub(crate) fn collect_child_ids(task: &Task, ids: &mut HashSet<String>) {
-    for child in &task.children {
-        ids.insert(child.id.clone());
-        collect_child_ids(child, ids);
-    }
-}
-
-pub(crate) fn get_task_ancestors(config: &AgendaConfig, task: &Task) -> Task {
-    let filename = task_filename_get(&task.id);
-    let full_path = config.vault_dir.join(&filename);
-    let lines = file_lines_get(full_path.to_string_lossy().as_ref());
-    let line_nr = task_line_get(&task.id);
-
-    if line_nr == 0 || line_nr > lines.len() {
-        return task.clone();
-    }
-
-    let current_line = &lines[line_nr - 1];
-    let current_indent = current_line.chars().take_while(|c| *c == ' ').count();
-
-    let mut ancestor_stack: Vec<(usize, String, String)> = Vec::new();
-
-    for i in (0..line_nr - 1).rev() {
-        let line = &lines[i];
-        let trimmed = line.trim();
-
-        if trimmed.starts_with('#') {
-            break;
-        }
-
-        if let Some(&(last_indent, _, _)) = ancestor_stack.last() {
-            if last_indent <= line.chars().take_while(|c| *c == ' ').count() {
-                continue;
-            }
-        }
-
-        let indent = line.chars().take_while(|c| *c == ' ').count();
-        if indent >= current_indent {
-            continue;
-        }
-
-        let is_bullet =
-            trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ");
-        let has_state = trimmed.contains("#TODO")
-            || trimmed.contains("#IN_PROGRESS")
-            || trimmed.contains("#DONE")
-            || trimmed.contains("#NEXT")
-            || trimmed.contains("#WAIT")
-            || trimmed.contains("#LATER");
-
-        if is_bullet && has_state {
-            let ancestor_id = format!("{}:{}", filename, i + 1);
-            ancestor_stack.push((indent, ancestor_id, line.clone()));
-        }
-    }
-
-    if ancestor_stack.is_empty() {
-        return task.clone();
-    }
-
-    let mut result = task.clone();
-
-    for (_, ancestor_id, ancestor_line) in ancestor_stack {
-        let ancestor = Task::from_string(&ancestor_line, &ancestor_id);
-        let mut wrapped = ancestor;
-        wrapped.children = vec![result];
-        result = wrapped;
-    }
-
-    result
-}
-
-fn line_number_from_id(id: &str) -> usize {
-    id.rsplitn(2, ':')
-        .next()
-        .and_then(|n| n.parse::<usize>().ok())
-        .unwrap_or(0)
-}
-
-pub(crate) fn merge_task_trees(tasks: Vec<Task>) -> Vec<Task> {
-    let mut root_map: std::collections::HashMap<String, Task> = std::collections::HashMap::new();
-    let mut root_order: Vec<String> = Vec::new();
-
-    for task in tasks {
-        if let Some(existing) = root_map.get_mut(&task.id) {
-            merge_children(existing, task.children);
-        } else {
-            root_order.push(task.id.clone());
-            root_map.insert(task.id.clone(), task);
-        }
-    }
-
-    root_order
-        .into_iter()
-        .filter_map(|id| root_map.remove(&id))
-        .collect()
-}
-
-fn merge_children(parent: &mut Task, new_children: Vec<Task>) {
-    for child in new_children {
-        if let Some(existing) = parent.children.iter_mut().find(|c| c.id == child.id) {
-            merge_children(existing, child.children);
-        } else {
-            let insert_pos = parent
-                .children
-                .iter()
-                .position(|c| line_number_from_id(&c.id) > line_number_from_id(&child.id))
-                .unwrap_or(parent.children.len());
-            parent.children.insert(insert_pos, child);
-        }
-    }
-}
-
 fn handle_get_by_id(config: &AgendaConfig, id: &str) -> Value {
     json!({ "task": task_get_by_id(config, id) })
-}
-
-fn handle_get_grouped(config: &AgendaConfig, group: &str, sort: &Option<Vec<String>>) -> Value {
-    let mut tasks = tasks_get(config);
-    sort_or_default(&mut tasks, sort);
-    match group {
-        "date" => json!(tasks_group_by_property(&tasks, "scheduled")),
-        "tag" => json!(tasks_group_by_property(&tasks, "tag")),
-        _ => json!(tasks_group_by_property(&tasks, group)),
-    }
 }
 
 fn handle_get_next_state(state: &str) -> Value {
@@ -327,8 +138,55 @@ fn handle_get_previous_state(state: &str) -> Value {
     serde_json::Value::String(task_state_prev(state))
 }
 
-fn handle_get_parent(config: &AgendaConfig, child_id: &str) -> Value {
-    json!({ "task": task_parent_get(config, child_id.to_string()) })
+fn handle_get_parent() -> Value {
+    // TODO: Temporarily neutered during parsing refactor. Needs reimplementation using resolve_task_tree.
+    json!({ "task": null })
+}
+
+fn collect_child_ids(task: &Task, ids: &mut HashSet<String>) {
+    for child in &task.children {
+        ids.insert(child.id.clone());
+        collect_child_ids(child, ids);
+    }
+}
+
+fn handle_get_parent_children(
+    config: &AgendaConfig,
+    parent_id: &str,
+    state: &Option<Vec<String>>,
+    exclude_state: &Option<Vec<String>>,
+    tag: &Option<String>,
+    property: &Option<Vec<String>>,
+    title: &Option<String>,
+    query: &Option<String>,
+) -> Value {
+    let mut tasks = task_get_direct_children(config, &parent_id);
+
+    if let Some(states) = exclude_state {
+        tasks = tasks_filter_by_states(&tasks, states);
+    }
+    if let Some(states) = state {
+        tasks = tasks_filter_by_states_included(&tasks, states);
+    }
+    if let Some(t) = tag {
+        tasks = tasks_filter_by_tag(&tasks, t);
+    }
+    if let Some((key, value)) = parse_property_filter(property) {
+        tasks = tasks_filter_by_property(&tasks, key, value);
+    }
+    if let Some(t) = title {
+        tasks = tasks_filter_by_title(&tasks, t);
+    }
+    if let Some(q) = query.as_ref() {
+        match crate::query::parse_and_filter(q, &tasks) {
+            Ok(filtered) => tasks = filtered,
+            Err(e) => {
+                return json!({"code": 400, "error": e.to_string()});
+            }
+        }
+    }
+
+    json!(tasks)
 }
 
 fn sort_or_default(tasks: &mut Vec<Task>, sort: &Option<Vec<String>>) {
@@ -336,6 +194,23 @@ fn sort_or_default(tasks: &mut Vec<Task>, sort: &Option<Vec<String>>) {
         tasks_sort_by(tasks, sort_criteria);
     } else {
         tasks_sort(tasks);
+    }
+}
+
+fn handle_query_debug(query: &str) -> Value {
+    use crate::query::{analyze_query, parse_query, strategy_regex};
+
+    match parse_query(query) {
+        Ok(expr) => {
+            let strategy = analyze_query(&expr);
+            let regex = strategy_regex(&strategy);
+            json!({
+                "ast": expr,
+                "strategy": strategy,
+                "regex": regex,
+            })
+        }
+        Err(e) => json!({"code": 400, "error": e.to_string()}),
     }
 }
 
@@ -350,6 +225,7 @@ fn parse_property_filter(property: &Option<Vec<String>>) -> Option<(&str, Option
     })
 }
 
+#[allow(deprecated)]
 fn handle_get_filtered_tasks(
     config: &AgendaConfig,
     state: &Option<Vec<String>>,
@@ -357,9 +233,10 @@ fn handle_get_filtered_tasks(
     tag: &Option<String>,
     property: &Option<Vec<String>>,
     sort: &Option<Vec<String>>,
-    content: &Option<String>,
+    title: &Option<String>,
     include_children: bool,
     include_ancestors: bool,
+    query: &Option<String>,
 ) -> Value {
     let repo = MarkdownTaskRepository::new(config.clone());
 
@@ -370,14 +247,26 @@ fn handle_get_filtered_tasks(
     let filter_tag = tag.as_deref();
     let filter_property = parse_property_filter(property);
 
-    let tasks = repo
-        .load_tasks_with_filter(
+    let tasks = if let Some(q) = query.as_ref() {
+        match crate::query::parse_query(q) {
+            Ok(expr) => {
+                let strategy = crate::query::analyze_query(&expr);
+                match repo.load_tasks_for_query(&strategy) {
+                    Ok(tasks) => tasks,
+                    Err(_) => repo.load_all_tasks().unwrap_or_default(),
+                }
+            }
+            Err(_) => repo.load_all_tasks().unwrap_or_default(),
+        }
+    } else {
+        repo.load_tasks_with_filter(
             include_states.as_ref(),
             exclude_states.as_ref(),
             filter_tag,
             filter_property,
         )
-        .unwrap_or_default();
+        .unwrap_or_default()
+    };
 
     let mut tasks = tasks;
     sort_or_default(&mut tasks, sort);
@@ -394,43 +283,36 @@ fn handle_get_filtered_tasks(
     if let Some((key, value)) = filter_property {
         tasks = tasks_filter_by_property(&tasks, key, value);
     }
-    if let Some(c) = content {
-        tasks = tasks_filter_by_content(&tasks, c);
+    if let Some(c) = title {
+        tasks = tasks_filter_by_title(&tasks, c);
+    }
+    if let Some(q) = query.as_ref() {
+        match crate::query::parse_and_filter(q, &tasks) {
+            Ok(filtered) => tasks = filtered,
+            Err(e) => {
+                return json!({"code": 400, "error": e.to_string()});
+            }
+        }
     }
 
     if include_children {
         for task in &mut tasks {
-            task.children = get_task_children(config, &task.id);
+            *task = resolve_task_tree(config, &task.id);
         }
+
+        let mut non_roots: HashSet<String> = HashSet::new();
+        for task in &tasks {
+            collect_child_ids(task, &mut non_roots);
+        }
+        tasks = tasks
+            .into_iter()
+            .filter(|t| !non_roots.contains(&t.id))
+            .collect();
     }
 
     if include_ancestors {
-        let mut tasks_with_ancestors: Vec<Task> = vec![];
-        for task in &tasks {
-            let rooted = get_task_ancestors(config, task);
-            tasks_with_ancestors.push(rooted);
-        }
-        tasks = merge_task_trees(tasks_with_ancestors);
-
-        let mut non_roots: HashSet<String> = HashSet::new();
-        for task in &tasks {
-            collect_child_ids(task, &mut non_roots);
-        }
-        tasks = tasks
-            .into_iter()
-            .filter(|t| !non_roots.contains(&t.id))
-            .collect();
-    }
-
-    if include_children && !include_ancestors {
-        let mut non_roots: HashSet<String> = HashSet::new();
-        for task in &tasks {
-            collect_child_ids(task, &mut non_roots);
-        }
-        tasks = tasks
-            .into_iter()
-            .filter(|t| !non_roots.contains(&t.id))
-            .collect();
+        // TODO: Temporarily neutered during parsing refactor. Needs reimplementation.
+        // Parent/ancestor chain resolution will be rebuilt using resolve_task_tree.
     }
 
     json!(tasks)
@@ -440,7 +322,7 @@ fn handle_set(
     config: &AgendaConfig,
     id: Option<&str>,
     line: Option<&str>,
-    content: Option<&str>,
+    title: Option<&str>,
     state: Option<&str>,
     property: &Option<Vec<String>>,
     tag: &Option<Vec<String>>,
@@ -450,7 +332,7 @@ fn handle_set(
     let has_property = property.is_some();
     let has_tag = tag.is_some();
     let has_line = line.is_some();
-    let has_fields = content.is_some()
+    let has_fields = title.is_some()
         || state.is_some()
         || has_property
         || has_tag
@@ -458,7 +340,7 @@ fn handle_set(
         || remove_properties;
 
     if has_line && has_fields {
-        return json!({"code": 400, "error": "Cannot use --line with field arguments (--content, --state, --property, --tag). They are mutually exclusive."});
+        return json!({"code": 400, "error": "Cannot use --line with field arguments (--title, --state, --property, --tag). They are mutually exclusive."});
     }
 
     let id = match id {
@@ -472,7 +354,7 @@ fn handle_set(
     }
 
     if !has_fields {
-        return json!({"code": 400, "error": "Either --line or at least one field argument (--content, --state, --property, --tag) is required."});
+        return json!({"code": 400, "error": "Either --line or at least one field argument (--title, --state, --property, --tag) is required."});
     }
 
     let properties: std::collections::HashMap<String, String> = property
@@ -503,7 +385,7 @@ fn handle_set(
     match task_set_fields(
         config,
         id,
-        content,
+        title,
         state,
         if properties.is_empty() { None } else { Some(&properties) },
         tags.as_deref(),
@@ -515,8 +397,8 @@ fn handle_set(
     }
 }
 
-fn handle_add(config: &AgendaConfig, content: &str, task_id: Option<&str>) -> Value {
-    task_add(config, content, task_id);
+fn handle_add(config: &AgendaConfig, title: &str, task_id: Option<&str>) -> Value {
+    task_add(config, title, task_id);
     json!({"code": 200, "message": "task added"})
 }
 
@@ -544,7 +426,7 @@ fn handle_change(
 
 fn handle_capture(
     config: &AgendaConfig,
-    content: &str,
+    title: &str,
     target: Option<&str>,
     state: Option<&str>,
     property: &Option<Vec<String>>,
@@ -576,7 +458,7 @@ fn handle_capture(
         })
         .unwrap_or_default();
 
-    match task_capture(config, content, target, state, &properties, &tags) {
+    match task_capture(config, title, target, state, &properties, &tags) {
         Ok(task_id) => json!({"code": 200, "message": "task captured", "taskId": task_id}),
         Err(e) => json!({"code": 400, "error": e}),
     }
@@ -588,30 +470,43 @@ pub fn get_output() -> Value {
 
     match &args.command {
         Commands::Get {
-            group,
             task_id,
             next_state,
             previous_state,
             parent_of,
+            parent,
             tag,
             property,
             exclude_state,
             state,
             sort,
-            content,
+            title,
             include_children,
             include_ancestors,
+            query,
+            query_debug,
         } => {
-            if let Some(id) = task_id {
+            if let Some(q) = query_debug {
+                handle_query_debug(q)
+            } else if let Some(id) = task_id {
                 handle_get_by_id(&config, id)
-            } else if let Some(group) = group {
-                handle_get_grouped(&config, group, sort)
             } else if let Some(ns) = next_state {
                 handle_get_next_state(ns)
             } else if let Some(ps) = previous_state {
                 handle_get_previous_state(ps)
-            } else if let Some(cid) = parent_of {
-                handle_get_parent(&config, cid)
+            } else if let Some(_cid) = parent_of {
+                handle_get_parent()
+            } else if let Some(parent_id) = parent {
+                handle_get_parent_children(
+                    &config,
+                    parent_id.as_str(),
+                    state,
+                    exclude_state,
+                    tag,
+                    property,
+                    title,
+                    query,
+                )
             } else {
                 handle_get_filtered_tasks(
                     &config,
@@ -620,16 +515,17 @@ pub fn get_output() -> Value {
                     tag,
                     property,
                     sort,
-                    content,
+                    title,
                     *include_children,
                     *include_ancestors,
+                    query,
                 )
             }
         }
         Commands::Set {
             id,
             line,
-            content,
+            title,
             state,
             property,
             tag,
@@ -639,14 +535,14 @@ pub fn get_output() -> Value {
             &config,
             id.as_deref(),
             line.as_deref(),
-            content.as_deref(),
+            title.as_deref(),
             state.as_deref(),
             property,
             tag,
             *remove_tags,
             *remove_properties,
         ),
-        Commands::Add { content, task_id } => handle_add(&config, content, task_id.as_deref()),
+        Commands::Add { title, task_id } => handle_add(&config, title, task_id.as_deref()),
         Commands::Change {
             task_id,
             state,
@@ -657,11 +553,11 @@ pub fn get_output() -> Value {
             json!({"code": 200, "message": "backlinks generated"})
         }
         Commands::Capture {
-            content,
+            title,
             target,
             state,
             property,
             tag,
-        } => handle_capture(&config, content, target.as_deref(), state.as_deref(), property, tag),
+        } => handle_capture(&config, title, target.as_deref(), state.as_deref(), property, tag),
     }
 }

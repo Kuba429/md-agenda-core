@@ -58,6 +58,22 @@ When add new feature:
 * NEVER use user's personal vault for testing - ONLY test-vault
 * NEVER read or access files outside test-vault
 
+## Integration tests
+
+Each scenario is a subfolder in test-vault (e.g., `test-vault/basic/`).
+
+Each scenario folder contains `.md` file(s) with a `## Test Case` header describing what to test and expected result.
+
+When user asks to add a test:
+1. Read the scenario folder to find the test case description
+2. Write a test function in `src/integration_tests.rs` that:
+   - Uses `vault_path("scenario-name")` to point to the folder
+   - Runs the appropriate function (e.g., `tasks_grep`, `tasks_grep_property`)
+   - Asserts the expected result based on the test case description
+3. Run the test to verify it passes
+
+Each test case = one test function. Don't add extra tests.
+
 ## What is a task
 
 * A task is a bullet line (-, *, +) that has a state tag

@@ -1,1158 +1,576 @@
 #![cfg(test)]
 
-use std::path::{Path, PathBuf};
+mod scenarios {
+    use std::path::{Path, PathBuf};
 
-use crate::backlinks::{
-    build_backlink_section, collect_backlinks, collect_backlinks_using_index, generate_backlinks,
-    scan_vault_files, LinkIndex,
-};
-use crate::config::AgendaConfig;
-use crate::grep::{tasks_grep, tasks_grep_property};
-use crate::task::{task_capture, task_change_property, task_change_state, task_get_by_id, task_set_fields, tasks_ids_get};
-
-#[test]
-fn test_integration_with_context() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let backlinks = collect_backlinks("target", &files);
-    let with_context = backlinks.iter().find(|b| b.source_file == "with-context");
-    assert!(with_context.is_some());
-    let blocks = &with_context.unwrap().blocks;
-    assert!(!blocks.is_empty());
-    let has_context = blocks.iter().any(|b| b.lines.len() > 1);
-    assert!(has_context, "should contain context lines");
-}
-
-#[test]
-fn test_integration_nested_bullets() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let backlinks = collect_backlinks("target", &files);
-    let nested = backlinks.iter().find(|b| b.source_file == "nested");
-    assert!(nested.is_some());
-    let blocks = &nested.unwrap().blocks;
-    assert!(!blocks.is_empty());
-}
-
-#[test]
-fn test_integration_multiple_sources() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let backlinks = collect_backlinks("target", &files);
-    let sources: Vec<&str> = backlinks.iter().map(|b| b.source_file.as_str()).collect();
-    assert!(sources.len() >= 2);
-}
-
-#[test]
-fn test_integration_link_only_excluded() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let backlinks = collect_backlinks("target", &files);
-
-    let section = build_backlink_section(&backlinks);
-
-    assert!(
-        section.contains("[[link-only]]"),
-        "link-only should be included in rendered output"
-    );
-}
-
-#[test]
-fn test_integration_link_only_included() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let backlinks = collect_backlinks("a-link-without-children", &files);
-
-    let section = build_backlink_section(&backlinks);
-
-    assert!(
-        section.contains("[[no-children]]"),
-        "link-only should now be included in backlinks"
-    );
-}
-
-#[test]
-fn test_collect_backlinks_index_vs_parallel_parity() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let index = LinkIndex::build(&files);
-
-    let parallel_backlinks = collect_backlinks("target", &files);
-    let index_backlinks = collect_backlinks_using_index("target", &index, &files);
-
-    assert_eq!(
-        parallel_backlinks.len(),
-        index_backlinks.len(),
-        "same number of source files"
-    );
-
-    let parallel_sources: Vec<_> = parallel_backlinks.iter().map(|b| &b.source_file).collect();
-    let index_sources: Vec<_> = index_backlinks.iter().map(|b| &b.source_file).collect();
-    assert_eq!(parallel_sources, index_sources, "same source files");
-
-    for (p, i) in parallel_backlinks.iter().zip(index_backlinks.iter()) {
-        assert_eq!(
-            p.blocks.len(),
-            i.blocks.len(),
-            "same number of blocks per source"
-        );
+    pub fn vault_path(scenario: &str) -> PathBuf {
+        Path::new("test-vault").join(scenario)
     }
 }
 
-#[test]
-fn test_collect_backlinks_index_no_unrelated_blocks_regression() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let index = LinkIndex::build(&files);
-    let backlinks = collect_backlinks_using_index("target", &index, &files);
+#[cfg(test)]
+mod task_grep {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::grep::tasks_grep;
 
-    assert!(!backlinks.is_empty());
-}
+    #[test]
+    fn basic_no_filter_returns_1_task() {
+        let config = AgendaConfig::new(vault_path("basic"));
+        let result = tasks_grep(&config, None).unwrap();
 
-#[test]
-fn test_collect_backlinks_index_nested_bullets() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let index = LinkIndex::build(&files);
+        let tasks: Vec<&str> = result.lines().filter(|l| l.contains(".md:")).collect();
+        assert_eq!(tasks.len(), 1, "should return exactly 1 task");
 
-    let parallel_backlinks = collect_backlinks("target", &files);
-    let index_backlinks = collect_backlinks_using_index("target", &index, &files);
-
-    let nested_parallel = parallel_backlinks
-        .iter()
-        .find(|b| b.source_file == "nested");
-    let nested_index = index_backlinks.iter().find(|b| b.source_file == "nested");
-
-    if nested_parallel.is_some() {
-        assert!(nested_index.is_some());
-        assert_eq!(
-            nested_parallel.unwrap().blocks.len(),
-            nested_index.unwrap().blocks.len(),
-            "nested blocks count should match"
+        assert!(
+            tasks[0].contains("task") && !tasks[0].contains("child"),
+            "task should be 'task' not 'child'"
         );
+    }
+
+    #[test]
+    fn filter_state_next_returns_1_task() {
+        use std::collections::HashSet;
+        use crate::grep::tasks_grep_include;
+
+        let config = AgendaConfig::new(vault_path("filter"));
+        let mut included = HashSet::new();
+        included.insert("NEXT".to_string());
+        let result = tasks_grep_include(&config, &included).unwrap();
+
+        let tasks: Vec<&str> = result.lines().filter(|l| l.contains(".md:")).collect();
+        assert_eq!(tasks.len(), 1, "should return exactly 1 task");
+        assert!(tasks[0].contains("task2"), "task should be 'task2'");
+    }
+
+    #[test]
+    fn filter_exclude_next_returns_3_tasks() {
+        let config = AgendaConfig::new(vault_path("filter"));
+        let mut excluded = std::collections::HashSet::new();
+        excluded.insert("NEXT".to_string());
+        let result = tasks_grep(&config, Some(&excluded)).unwrap();
+
+        let tasks: Vec<&str> = result.lines().filter(|l| l.contains(".md:")).collect();
+        assert_eq!(tasks.len(), 4, "should return all TODO tasks when NEXT excluded (including nested)");
     }
 }
 
-#[test]
-fn test_parent_link_backlink_section() {
-    let vault_path = Path::new("test-vault/parent-link-test");
-    let files = scan_vault_files(vault_path);
+#[cfg(test)]
+mod task_grep_property {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::grep::tasks_grep_property;
 
-    let backlinks = collect_backlinks("target-new", &files);
+    #[test]
+    fn filter_property_scheduled_returns_1_task() {
+        let config = AgendaConfig::new(vault_path("filter"));
+        let result = tasks_grep_property(&config, "scheduled").unwrap();
 
-    assert_eq!(backlinks.len(), 2, "should have 2 source files");
+        let tasks: Vec<&str> = result.lines().filter(|l| l.contains(".md:")).collect();
+        assert_eq!(tasks.len(), 1, "should return exactly 1 task");
+        assert!(tasks[0].contains("task3"), "task should be 'task3'");
+    }
 
-    let section = build_backlink_section(&backlinks);
+    #[test]
+    fn filter_property_scheduled_value_returns_1_task() {
+        let config = AgendaConfig::new(vault_path("filter"));
+        let result = tasks_grep_property(&config, "scheduled=2025-04-20").unwrap();
 
-    assert!(section.contains("[[bar]]"), "should include bar");
-    assert!(section.contains("[[foo]]"), "should include foo");
+        let tasks: Vec<&str> = result.lines().filter(|l| l.contains(".md:")).collect();
+        assert_eq!(tasks.len(), 1, "should return exactly 1 task");
+        assert!(tasks[0].contains("task3"), "task should be 'task3'");
+    }
 
-    assert!(
-        !section.contains("* [[target-new]]"),
-        "link-only line should be skipped"
-    );
-    assert!(
-        section.contains("this should be included"),
-        "should include child context"
-    );
+    #[test]
+    fn filter_property_scheduled_value_no_match_returns_0_tasks() {
+        let config = AgendaConfig::new(vault_path("filter"));
+        let result = tasks_grep_property(&config, "scheduled=2025-04-21").unwrap();
+
+        let tasks: Vec<&str> = result.lines().filter(|l| l.contains(".md:")).collect();
+        assert_eq!(tasks.len(), 0, "should return 0 tasks");
+    }
 }
 
-#[test]
-fn test_double_link_single_block_both_targets() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
+#[cfg(test)]
+mod query_dsl {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::query::parse_and_filter;
+    use crate::repository::MarkdownTaskRepository;
 
-    let backlinks_target = collect_backlinks("target", &files);
-    let backlinks_target2 = collect_backlinks("target2", &files);
+    fn load_tasks() -> Vec<crate::task::Task> {
+        let config = AgendaConfig::new(vault_path("query"));
+        let repo = MarkdownTaskRepository::new(config);
+        repo.load_all_tasks().unwrap()
+    }
 
-    let double_link = backlinks_target
-        .iter()
-        .find(|b| b.source_file == "double-link");
-    assert!(
-        double_link.is_some(),
-        "double-link should be in target's backlinks"
-    );
+    fn count_by_title(tasks: &[crate::task::Task], title: &str) -> usize {
+        tasks
+            .iter()
+            .filter(|t| t.title.contains(title))
+            .count()
+    }
 
-    let double_link2 = backlinks_target2
-        .iter()
-        .find(|b| b.source_file == "double-link");
-    assert!(
-        double_link2.is_some(),
-        "double-link should be in target2's backlinks"
-    );
+    #[test]
+    fn query_tag_foo() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("tag:foo", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_tag_foo"), 1);
+        assert_eq!(count_by_title(&result, "task_with_both_tags"), 1);
+        assert_eq!(count_by_title(&result, "task_with_tag_and_property"), 1);
+        assert_eq!(count_by_title(&result, "task_in_progress"), 1);
+        assert_eq!(count_by_title(&result, "done_task"), 1);
+        assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn query_tag_bar() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("tag:bar", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_tag_bar"), 1);
+        assert_eq!(count_by_title(&result, "task_with_both_tags"), 1);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn query_property_priority_equals_high() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("property:priority=high", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_property_prio"), 1);
+        assert_eq!(count_by_title(&result, "task_with_tag_and_property"), 1);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn query_tag_foo_and_property_priority_equals_high() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("tag:foo AND property:priority=high", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_tag_and_property"), 1);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn query_tag_foo_or_tag_bar() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("tag:foo OR tag:bar", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_tag_foo"), 1);
+        assert_eq!(count_by_title(&result, "task_with_tag_bar"), 1);
+        assert_eq!(count_by_title(&result, "task_with_both_tags"), 1);
+        assert_eq!(count_by_title(&result, "task_with_tag_and_property"), 1);
+        assert_eq!(count_by_title(&result, "task_in_progress"), 1);
+        assert_eq!(count_by_title(&result, "done_task"), 1);
+        assert_eq!(result.len(), 6);
+    }
+
+    #[test]
+    fn query_tag_foo_and_not_tag_bar() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("tag:foo AND -tag:bar", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_tag_foo"), 1);
+        assert_eq!(count_by_title(&result, "task_with_tag_and_property"), 1);
+        assert_eq!(count_by_title(&result, "task_in_progress"), 1);
+        assert_eq!(count_by_title(&result, "done_task"), 1);
+        assert_eq!(result.len(), 4);
+        assert_eq!(count_by_title(&result, "task_with_both_tags"), 0);
+    }
+
+    #[test]
+    fn query_tag_foo_and_property_priority_high_and_not_tag_foo_bar() {
+        let tasks = load_tasks();
+        let result =
+            parse_and_filter("tag:foo AND property:priority=high AND -tag:foo_bar", &tasks)
+                .unwrap();
+        assert_eq!(count_by_title(&result, "task_with_tag_and_property"), 1);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn query_state_todo() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("state:TODO", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_tag_foo"), 1);
+        assert_eq!(count_by_title(&result, "task_with_tag_bar"), 1);
+        assert_eq!(count_by_title(&result, "task_with_both_tags"), 1);
+        assert_eq!(count_by_title(&result, "task_with_foo_bar_tag"), 1);
+        assert_eq!(count_by_title(&result, "task_with_property_prio"), 1);
+        assert_eq!(count_by_title(&result, "task_with_tag_and_property"), 1);
+        assert_eq!(count_by_title(&result, "task_with_property_scheduled"), 1);
+        assert_eq!(count_by_title(&result, "meeting_notes_task"), 1);
+        assert_eq!(count_by_title(&result, "task_with_scheduled_time"), 1);
+        assert_eq!(result.len(), 9);
+    }
+
+    #[test]
+    fn query_nested_and_or() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("(tag:foo OR tag:bar) AND state:TODO", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_tag_foo"), 1);
+        assert_eq!(count_by_title(&result, "task_with_tag_bar"), 1);
+        assert_eq!(count_by_title(&result, "task_with_both_tags"), 1);
+        assert_eq!(count_by_title(&result, "task_with_tag_and_property"), 1);
+        assert_eq!(result.len(), 4);
+        assert_eq!(count_by_title(&result, "task_in_progress"), 0);
+        assert_eq!(count_by_title(&result, "done_task"), 0);
+    }
+
+    #[test]
+    fn query_title_meeting() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("title:meeting", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "meeting_notes_task"), 1);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn query_not_state_done() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("-state:DONE", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "done_task"), 0);
+        assert_eq!(result.len(), 10);
+    }
+
+    #[test]
+    fn query_property_scheduled_exists() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("property:scheduled", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_property_scheduled"), 1);
+        assert_eq!(count_by_title(&result, "task_with_scheduled_time"), 1);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn query_property_date_matches_datetime() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("property:scheduled=2024-01-15", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_property_scheduled"), 1);
+        assert_eq!(count_by_title(&result, "task_with_scheduled_time"), 1);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn query_property_datetime_exact_match() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("property:scheduled=2024-01-15T10:30", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_scheduled_time"), 1);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn query_property_not_exists() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("-property:scheduled", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_property_scheduled"), 0);
+        assert_eq!(result.len(), 9);
+    }
+
+    #[test]
+    fn query_negated_group() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("-(tag:foo AND tag:bar)", &tasks).unwrap();
+        assert_eq!(count_by_title(&result, "task_with_both_tags"), 0);
+        assert_eq!(result.len(), 10);
+    }
+
+    #[test]
+    fn query_empty_result() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("tag:nonexistent", &tasks).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn query_invalid_returns_error() {
+        let tasks = load_tasks();
+        let result = parse_and_filter("tag:", &tasks);
+        assert!(result.is_err());
+    }
 }
 
-#[test]
-fn test_double_link_header_omitted_when_only_link() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
+#[cfg(test)]
+mod query_grep_strategy {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::query::{analyze_query, parse_query, filter_tasks, GrepStrategy};
+    use crate::repository::MarkdownTaskRepository;
+    use std::collections::HashSet;
 
-    let backlinks = collect_backlinks("target", &files);
-    let section = build_backlink_section(&backlinks);
+    fn load_via_strategy(strategy: &GrepStrategy) -> Vec<crate::task::Task> {
+        let config = AgendaConfig::new(vault_path("query"));
+        let repo = MarkdownTaskRepository::new(config);
+        repo.load_tasks_for_query(strategy).unwrap()
+    }
 
-    assert!(
-        section.contains("[[double-link]]"),
-        "double-link should be included"
-    );
-    let double_link_in_section = backlinks.iter().find(|b| b.source_file == "double-link");
-    assert!(
-        double_link_in_section.is_some(),
-        "double-link should have backlink"
-    );
+    fn count_by_title(tasks: &[crate::task::Task], title: &str) -> usize {
+        tasks
+            .iter()
+            .filter(|t| t.title.contains(title))
+            .count()
+    }
+
+    #[test]
+    fn strategy_tag_returns_tagged_tasks() {
+        let strategy = GrepStrategy::Tag { tag: "foo".to_string() };
+        let tasks = load_via_strategy(&strategy);
+        let filtered = {
+            let expr = parse_query("tag:foo").unwrap();
+            filter_tasks(&expr, &tasks)
+        };
+        assert_eq!(filtered.len(), 5);
+        assert_eq!(count_by_title(&filtered, "task_with_tag_foo"), 1);
+    }
+
+    #[test]
+    fn strategy_multitag_returns_or_tagged_tasks() {
+        let strategy = GrepStrategy::MultiTag { tags: vec!["foo".to_string(), "bar".to_string()] };
+        let tasks = load_via_strategy(&strategy);
+        let filtered = {
+            let expr = parse_query("tag:foo OR tag:bar").unwrap();
+            filter_tasks(&expr, &tasks)
+        };
+        assert_eq!(filtered.len(), 6);
+    }
+
+    #[test]
+    fn strategy_include_state_returns_state_tasks() {
+        let mut states = HashSet::new();
+        states.insert("TODO".to_string());
+        let strategy = GrepStrategy::IncludeState { states };
+        let tasks = load_via_strategy(&strategy);
+        let all_todo = tasks.iter().all(|t| t.state == "TODO");
+        assert!(all_todo);
+        assert!(tasks.len() >= 8);
+    }
+
+    #[test]
+    fn strategy_exclude_state_excludes() {
+        let mut exclude = HashSet::new();
+        exclude.insert("DONE".to_string());
+        let strategy = GrepStrategy::ExcludeState { exclude };
+        let tasks = load_via_strategy(&strategy);
+        assert!(tasks.iter().all(|t| t.state != "DONE"));
+        assert!(tasks.iter().all(|t| t.state != "CANCELLED"));
+    }
+
+    #[test]
+    fn strategy_property_returns_matching_tasks() {
+        let strategy = GrepStrategy::Property { property: "priority=high".to_string() };
+        let tasks = load_via_strategy(&strategy);
+        assert!(tasks.len() >= 2);
+        assert!(tasks.iter().any(|t| t.title.contains("task_with_property_prio")));
+        assert!(tasks.iter().any(|t| t.title.contains("task_with_tag_and_property")));
+    }
+
+    #[test]
+    fn strategy_all_returns_everything() {
+        let strategy = GrepStrategy::All;
+        let tasks = load_via_strategy(&strategy);
+        assert_eq!(tasks.len(), 11);
+    }
+
+    #[test]
+    fn analyze_end_to_end_tag_and_property() {
+        let expr = parse_query("tag:foo AND property:priority=high").unwrap();
+        let strategy = analyze_query(&expr);
+        let tasks = load_via_strategy(&strategy);
+        let result = filter_tasks(&expr, &tasks);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].title.contains("task_with_tag_and_property"));
+    }
+
+    #[test]
+    fn analyze_end_to_end_or_tags() {
+        let expr = parse_query("tag:foo OR tag:bar").unwrap();
+        let strategy = analyze_query(&expr);
+        let tasks = load_via_strategy(&strategy);
+        let result = filter_tasks(&expr, &tasks);
+        assert_eq!(result.len(), 6);
+    }
 }
 
-#[test]
-fn test_double_link_context_included_with_other_links() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
+#[cfg(test)]
+mod parent_children {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::task::task_get_direct_children;
 
-    let backlinks = collect_backlinks("target", &files);
-    let double_link = backlinks.iter().find(|b| b.source_file == "double-link");
+    #[test]
+    fn returns_direct_children() {
+        let config = AgendaConfig::new(vault_path("parent-basic"));
+        let children = task_get_direct_children(&config, "file.md:1");
+        assert_eq!(children.len(), 2, "should return 2 direct children");
+        assert!(children.iter().any(|c| c.title == "child1"));
+        assert!(children.iter().any(|c| c.title == "child2"));
+        assert!(children.iter().all(|c| c.parent == Some("file.md:1".to_string())));
+    }
 
-    assert!(double_link.is_some());
-    let blocks = &double_link.unwrap().blocks;
-    assert!(!blocks.is_empty(), "should have blocks with context");
+    #[test]
+    fn does_not_include_parent_or_siblings() {
+        let config = AgendaConfig::new(vault_path("parent-basic"));
+        let children = task_get_direct_children(&config, "file.md:1");
+        assert!(children.iter().all(|c| c.title != "parent_task"));
+        assert!(children.iter().all(|c| c.title != "other_task"));
+    }
+
+    #[test]
+    fn parent_filter_state_done() {
+        let config = AgendaConfig::new(vault_path("parent-basic"));
+        let children = task_get_direct_children(&config, "file.md:1");
+        let done: Vec<_> = children.into_iter().filter(|c| c.state == "DONE").collect();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].title, "child2");
+    }
+
+    #[test]
+    fn returns_all_children_with_tags() {
+        let config = AgendaConfig::new(vault_path("parent-filtered"));
+        let children = task_get_direct_children(&config, "file.md:1");
+        assert_eq!(children.len(), 4, "should return 4 children");
+    }
+
+    #[test]
+    fn parent_filter_tag() {
+        let config = AgendaConfig::new(vault_path("parent-filtered"));
+        let children = task_get_direct_children(&config, "file.md:1");
+        let bug: Vec<_> = children.into_iter().filter(|c| c.tags.contains(&"bug".to_string())).collect();
+        assert_eq!(bug.len(), 1);
+        assert_eq!(bug[0].title, "child_bug");
+    }
+
+    #[test]
+    fn parent_nested_returns_only_direct_children() {
+        let config = AgendaConfig::new(vault_path("parent-nested"));
+        let children = task_get_direct_children(&config, "file.md:2");
+        assert_eq!(children.len(), 2, "should return 2 direct children");
+        assert!(children.iter().all(|c| c.title == "child1" || c.title == "child2"));
+    }
+
+    #[test]
+    fn parent_nested_does_not_include_siblings() {
+        let config = AgendaConfig::new(vault_path("parent-nested"));
+        let children = task_get_direct_children(&config, "file.md:2");
+        assert!(children.iter().all(|c| c.title != "parent_sibling"));
+        assert!(children.iter().all(|c| c.title != "grandparent"));
+    }
+
+    #[test]
+    fn parent_no_children_returns_empty() {
+        let config = AgendaConfig::new(vault_path("parent-no-children"));
+        let children = task_get_direct_children(&config, "file.md:1");
+        assert!(children.is_empty());
+    }
+
+    #[test]
+    fn parent_mixed_ignores_non_task_lines() {
+        let config = AgendaConfig::new(vault_path("parent-mixed"));
+        let children = task_get_direct_children(&config, "file.md:1");
+        assert_eq!(children.len(), 2, "should return 2 children, not non-task lines");
+        assert!(children.iter().any(|c| c.title == "child1"));
+        assert!(children.iter().any(|c| c.title == "child2"));
+        assert!(children.iter().all(|c| c.state == "TODO" || c.state == "DONE"));
+    }
 }
 
-#[test]
-fn test_nested_link_only_includes_direct_children() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
+#[cfg(test)]
+mod include_children {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::repository::MarkdownTaskRepository;
+    use crate::task::{resolve_task_tree, tasks_filter_by_tag};
 
-    let backlinks = collect_backlinks("target", &files);
-    let section = build_backlink_section(&backlinks);
+    fn load_all(scenario: &str) -> Vec<crate::task::Task> {
+        let config = AgendaConfig::new(vault_path(scenario));
+        let repo = MarkdownTaskRepository::new(config);
+        repo.load_all_tasks().unwrap()
+    }
 
-    let parent_text_count = section.matches("this is a parent of a link").count();
+    #[test]
+    fn basic_includes_direct_children() {
+        let tasks = load_all("include-children-basic");
+        let mut matched: Vec<_> = tasks.into_iter().filter(|t| t.title == "parent").collect();
+        for task in &mut matched {
+            *task = resolve_task_tree(&AgendaConfig::new(vault_path("include-children-basic")), &task.id);
+        }
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].children.len(), 2);
+        assert!(matched[0].children.iter().any(|c| c.title == "child1"));
+        assert!(matched[0].children.iter().any(|c| c.title == "child2"));
+    }
 
-    assert_eq!(
-        parent_text_count, 0,
-        "should NOT include parent text bullets before the link"
-    );
-}
+    #[test]
+    fn basic_done_children_included() {
+        let tasks = load_all("include-children-basic");
+        let mut matched: Vec<_> = tasks.into_iter().filter(|t| t.title == "parent").collect();
+        for task in &mut matched {
+            *task = resolve_task_tree(&AgendaConfig::new(vault_path("include-children-basic")), &task.id);
+        }
+        assert!(matched[0].children.iter().any(|c| c.state == "DONE"));
+    }
 
-#[test]
-fn test_multi_link_sibling_bullets_not_included() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
+    #[test]
+    fn nested_preserves_hierarchy() {
+        let mut matched = load_all("include-children-nested");
+        for task in &mut matched {
+            *task = resolve_task_tree(&AgendaConfig::new(vault_path("include-children-nested")), &task.id);
+        }
+        let gp = matched.iter().find(|t| t.title == "grandparent").unwrap();
+        assert_eq!(gp.children.len(), 1);
+        assert_eq!(gp.children[0].title, "parent");
+        assert_eq!(gp.children[0].children.len(), 1);
+        assert_eq!(gp.children[0].children[0].title, "child");
+    }
 
-    let backlinks = collect_backlinks("target", &files);
-    let section = build_backlink_section(&backlinks);
+    #[test]
+    fn nested_dedup_removes_children_from_root() {
+        let tasks = load_all("include-children-nested");
+        // simulate filtering — no filter, all tasks matched
+        let mut matched: Vec<_> = tasks;
+        for task in &mut matched {
+            *task = resolve_task_tree(&AgendaConfig::new(vault_path("include-children-nested")), &task.id);
+        }
 
-    assert!(
-        !section.contains("it should't be included"),
-        "should NOT include sibling bullets of link"
-    );
-    assert!(
-        !section.contains("only bullets under the link bullet should be included"),
-        "should NOT include sibling bullets of link"
-    );
-    assert!(
-        !section.contains("this one should NOT be included"),
-        "should NOT include bullets not directly under link"
-    );
-
-    assert!(
-        section.contains("like this one"),
-        "should include direct child of link"
-    );
-}
-
-#[test]
-fn test_duplicate_link_from_same_file_separate_bullets() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-
-    let backlinks = collect_backlinks("target", &files);
-
-    let test_file = backlinks
-        .iter()
-        .find(|b| b.source_file == "backlink-tasks-test");
-    assert!(
-        test_file.is_some(),
-        "backlink-tasks-test should be in backlinks"
-    );
-
-    let blocks = &test_file.unwrap().blocks;
-    assert!(blocks.len() >= 3, "should have at least 3 separate blocks");
-
-    let section = build_backlink_section(&backlinks);
-    assert!(
-        section.contains("backlink-tasks-test"),
-        "should include backlink-tasks-test in section"
-    );
-}
-
-#[test]
-fn test_multi_link_bullet_properly_indented() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-
-    let backlinks = collect_backlinks("target", &files);
-    let section = build_backlink_section(&backlinks);
-
-    let double_link_section = backlinks
-        .iter()
-        .find(|b| b.source_file == "double-link")
-        .map(|b| {
-            let start = section
-                .find(&format!("- [[{}]]", b.source_file))
-                .unwrap_or(0);
-            &section[start..]
-        });
-
-    if let Some(ds) = double_link_section {
-        let lines: Vec<&str> = ds.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if line.contains("* [[target]]") {
-                let indent = line.len() - line.trim_start().len();
-                assert!(
-                    indent > 0,
-                    "multi-link bullet should be indented, got indent {}",
-                    indent
-                );
-                if i + 1 < lines.len() {
-                    let next_line = lines[i + 1];
-                    if next_line.trim().starts_with('*') {
-                        let next_indent = next_line.len() - next_line.trim_start().len();
-                        assert!(
-                            next_indent > indent,
-                            "child should be more indented than parent"
-                        );
-                    }
-                }
-                break;
+        // collect child IDs
+        let mut child_ids = std::collections::HashSet::new();
+        fn collect(c: &crate::task::Task, ids: &mut std::collections::HashSet<String>) {
+            for child in &c.children {
+                ids.insert(child.id.clone());
+                collect(child, ids);
             }
         }
+        for t in &matched {
+            collect(t, &mut child_ids);
+        }
+
+        // dedup
+        matched.retain(|t| !child_ids.contains(&t.id));
+        assert_eq!(matched.len(), 2); // grandparent and other remain
+        assert!(matched.iter().any(|t| t.title == "grandparent"));
+        assert!(matched.iter().any(|t| t.title == "other"));
     }
-}
 
-#[test]
-fn test_tasks_grep_excludes_backlinks_section() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep(&config, None).unwrap();
-
-    let backlink_tasks = vec!["with-context.md:7", "with-context.md:8"];
-
-    for task_ref in backlink_tasks {
-        assert!(
-            !result.contains(task_ref),
-            "should not find task {} in backlinks section",
-            task_ref
-        );
+    #[test]
+    fn filtered_only_matched_tasks_get_children() {
+        let config = AgendaConfig::new(vault_path("include-children-filtered"));
+        let tasks = load_all("include-children-filtered");
+        let mut matched = tasks_filter_by_tag(&tasks, "bug");
+        for task in &mut matched {
+            *task = resolve_task_tree(&config, &task.id);
+        }
+        // only tasks with #bug get children
+        assert!(matched.iter().any(|t| t.title == "parent" && t.children.len() == 2));
+        assert!(matched.iter().any(|t| t.title == "other" && t.children.len() == 1));
+        assert!(matched.iter().all(|t| t.title != "unrelated"));
     }
-}
 
-#[test]
-fn test_tasks_grep_excludes_backlinks_in_multiple_files() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep(&config, None).unwrap();
-
-    assert!(result.contains("perf-test-1.md:3"), "should find task 1");
-    assert!(result.contains("perf-test-1.md:4"), "should find task 2");
-    assert!(
-        result.contains("perf-test-1.md:5"),
-        "should find task 3 (IN_PROGRESS)"
-    );
-
-    assert!(
-        !result.contains("perf-test-1.md:8"),
-        "should NOT find task in backlinks"
-    );
-    assert!(
-        !result.contains("perf-test-1.md:9"),
-        "should NOT find DONE in backlinks"
-    );
-
-    assert!(result.contains("perf-test-2.md:3"), "should find Task A");
-    assert!(
-        result.contains("perf-test-2.md:4"),
-        "should find Task B (DONE)"
-    );
-
-    assert!(
-        !result.contains("perf-test-2.md:8"),
-        "should NOT find backlink task"
-    );
-}
-
-#[test]
-fn test_tasks_grep_property_scheduled() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep_property(&config, "scheduled").unwrap();
-
-    assert!(result.contains("@scheduled(2024-01-01)"));
-    assert!(result.contains("@scheduled(2024-01-03)"));
-}
-
-#[test]
-fn test_tasks_grep_property_priority() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep_property(&config, "priority").unwrap();
-
-    assert!(result.contains("@priority(1)"));
-    assert!(result.contains("@priority(2)"));
-}
-
-#[test]
-fn test_task_ids_get_returns_ids() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let ids = tasks_ids_get(&config);
-    assert!(!ids.is_empty(), "should get task ids");
-}
-
-#[test]
-fn test_collect_backlinks_nested_context_lines() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let backlinks = collect_backlinks("test1-target", &files);
-    let test1 = backlinks.iter().find(|b| b.source_file == "test1");
-    assert!(test1.is_some(), "test1 should be in backlinks");
-    let blocks = &test1.unwrap().blocks;
-    assert!(!blocks.is_empty(), "should have blocks");
-
-    let section = build_backlink_section(&backlinks);
-    assert!(
-        section.contains("this line should be included"),
-        "should include nested context lines"
-    );
-    assert!(
-        !section.contains("this line should NOT be included"),
-        "should NOT include sibling bullets of link"
-    );
-}
-
-#[test]
-fn test_generate_backlinks_creates_missing_file() {
-    let temp_dir = std::env::temp_dir().join("test_create_missing");
-    std::fs::create_dir_all(&temp_dir).ok();
-
-    let test_file = temp_dir.join("source.md");
-    std::fs::write(&test_file, "- [[new target file]]\n    * Some context").ok();
-
-    let result = generate_backlinks(temp_dir.to_str().unwrap(), "new target file");
-
-    assert!(result.is_ok());
-
-    let new_file = temp_dir.join("new-target-file.md");
-    assert!(new_file.exists(), "should create new target file");
-
-    let content = std::fs::read_to_string(&new_file).unwrap();
-    assert!(content.contains("# new target file"));
-    assert!(content.contains("[[source]]"));
-
-    std::fs::remove_dir_all(&temp_dir).ok();
-}
-
-#[test]
-fn test_backlink_context_includes_only_link_tree() {
-    let vault_path = Path::new("test-vault");
-    let files = scan_vault_files(vault_path);
-    let backlinks = collect_backlinks("test2-target", &files);
-    let test2 = backlinks.iter().find(|b| b.source_file == "test2");
-    assert!(test2.is_some(), "test2 should be in backlinks");
-    let blocks = &test2.unwrap().blocks;
-    assert!(!blocks.is_empty(), "should have blocks");
-
-    let section = build_backlink_section(&backlinks);
-    assert!(
-        section.contains("should be included"),
-        "should include lines under the link"
-    );
-    assert!(
-        !section.contains("this line is not a child"),
-        "should NOT include lines before/beside the link"
-    );
-    assert!(
-        !section.contains("should NOT be included"),
-        "should NOT include sibling bullets of link"
-    );
-}
-
-// Test scenarios from test-vault/test-filtering.md
-
-#[test]
-fn test_scenario_6_tag_filter_bug() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    use crate::grep::tasks_grep_tag;
-    use std::collections::HashSet;
-
-    let mut excluded = HashSet::new();
-    excluded.insert("DONE".to_string());
-    excluded.insert("CANCELLED".to_string());
-
-    let result = tasks_grep_tag(&config, "bug", Some(&excluded)).unwrap();
-
-    assert!(
-        result.contains("test-case-6.md:3"),
-        "should find first bug task"
-    );
-    assert!(
-        result.contains("test-case-6.md:5"),
-        "should find second bug task"
-    );
-    assert!(
-        !result.contains("test-case-6.md:4"),
-        "should NOT find feature task"
-    );
-}
-
-#[test]
-fn test_scenario_8_property_key_filter() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep_property(&config, "scheduled").unwrap();
-
-    assert!(
-        result.contains("test-case-8.md:3"),
-        "should find task with scheduled"
-    );
-    assert!(
-        result.contains("@scheduled(2024-01-15)"),
-        "should find scheduled property"
-    );
-    assert!(
-        !result.contains("test-case-8.md:5"),
-        "should NOT find task without scheduled"
-    );
-}
-
-#[test]
-fn test_scenario_10_no_tasks_match_filter() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    use crate::grep::tasks_grep;
-    use std::collections::HashSet;
-
-    let mut exclude_set = HashSet::new();
-    exclude_set.insert("DONE".to_string());
-    exclude_set.insert("CANCELLED".to_string());
-
-    let result = tasks_grep(&config, Some(&exclude_set)).unwrap();
-
-    assert!(
-        !result.contains("test-case-10.md"),
-        "should NOT find only done/cancelled tasks"
-    );
-}
-
-#[test]
-fn test_scenario_12_backlink_exclusion() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    use crate::grep::tasks_grep;
-    use std::collections::HashSet;
-
-    let mut exclude_set = HashSet::new();
-    exclude_set.insert("DONE".to_string());
-    exclude_set.insert("CANCELLED".to_string());
-
-    let result = tasks_grep(&config, Some(&exclude_set)).unwrap();
-
-    assert!(
-        result.contains("test-case-12.md:3"),
-        "should find task before backlinks"
-    );
-    assert!(
-        !result.contains("test-case-12.md:6"),
-        "should NOT find task in backlinks section"
-    );
-}
-
-#[test]
-fn test_scenario_14_property_key_value_scheduled() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep_property(&config, "scheduled=2024-01-15").unwrap();
-
-    assert!(
-        result.contains("test-case-14.md:3"),
-        "should find task with 2024-01-15"
-    );
-    assert!(
-        !result.contains("test-case-14.md:4"),
-        "should NOT find task with 2024-01-20"
-    );
-}
-
-#[test]
-fn test_scenario_15_property_key_value_priority() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep_property(&config, "priority=high").unwrap();
-
-    assert!(
-        result.contains("test-case-15.md:3"),
-        "should find first high priority"
-    );
-    assert!(
-        result.contains("test-case-15.md:5"),
-        "should find second high priority"
-    );
-    assert!(
-        !result.contains("test-case-15.md:4"),
-        "should NOT find low priority task"
-    );
-}
-
-#[test]
-fn test_property_filter_excludes_non_task_bullets() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep_property(&config, "scheduled").unwrap();
-
-    assert!(
-        !result.contains("prop-test.md:1"),
-        "should NOT find non-task bullet without state tag (line 1)"
-    );
-    assert!(
-        !result.contains("prop-test.md:2"),
-        "should NOT find non-task bullet without state tag (line 2)"
-    );
-    assert!(
-        !result.contains("prop-test.md:3"),
-        "should NOT find non-task bullet without state tag (line 3)"
-    );
-    assert!(
-        !result.contains("prop-test.md:5"),
-        "should NOT find non-task bullet without state tag (line 5)"
-    );
-    assert!(
-        !result.contains("prop-test.md:6"),
-        "should NOT find non-task bullet without state tag (line 6)"
-    );
-}
-
-#[test]
-fn test_property_filter_excludes_non_task_bullets_simple() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep_property(&config, "scheduled").unwrap();
-
-    assert!(
-        !result.contains("prop-test-simple.md:1"),
-        "should NOT find non-task bullet with @scheduled but no state tag"
-    );
-    assert!(
-        !result.contains("prop-test-simple.md:2"),
-        "should NOT find non-task bullet with @scheduled and #foo (non-state tag)"
-    );
-    assert!(
-        !result.contains("prop-test-simple.md:3"),
-        "should NOT find non-task bullet with @scheduled but no state tag"
-    );
-}
-
-#[test]
-fn test_property_filter_includes_real_tasks_with_property() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep_property(&config, "scheduled=2024-01-01").unwrap();
-
-    assert!(
-        result.contains("perf-test-1.md:3"),
-        "should find real task with #TODO and @scheduled"
-    );
-}
-
-#[test]
-fn test_include_ancestors_builds_path_to_root() {
-    use crate::cli::get_task_ancestors;
-    use crate::task::tasks_get;
-
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    let tasks = tasks_get(&config);
-
-    let grandchild = tasks
-        .iter()
-        .find(|t| t.id == "test-ancestry-path.md:3")
-        .expect("grandchild not found");
-    let rooted = get_task_ancestors(&config, grandchild);
-
-    assert_eq!(
-        rooted.id, "test-ancestry-path.md:1",
-        "root should be deep root"
-    );
-    assert_eq!(
-        rooted.children.len(),
-        1,
-        "root should have exactly one child (the ancestry path)"
-    );
-    assert_eq!(
-        rooted.children[0].id, "test-ancestry-path.md:2",
-        "child should be deep child"
-    );
-    assert_eq!(
-        rooted.children[0].children.len(),
-        1,
-        "deep child should have exactly one child"
-    );
-    assert_eq!(
-        rooted.children[0].children[0].id, "test-ancestry-path.md:3",
-        "grandchild should be at leaf"
-    );
-}
-
-#[test]
-fn test_include_ancestors_no_siblings_in_path() {
-    use crate::cli::get_task_ancestors;
-    use crate::task::tasks_get;
-
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    let tasks = tasks_get(&config);
-
-    let grandchild = tasks
-        .iter()
-        .find(|t| t.id == "test-ancestry-path.md:3")
-        .expect("grandchild not found");
-    let rooted = get_task_ancestors(&config, grandchild);
-
-    let deep_child = &rooted.children[0];
-    let has_sibling = deep_child
-        .children
-        .iter()
-        .any(|c| c.id == "test-ancestry-path.md:4");
-    assert!(!has_sibling, "ancestry path should NOT include siblings");
-}
-
-#[test]
-fn test_include_ancestors_root_task_unchanged() {
-    use crate::cli::get_task_ancestors;
-    use crate::task::tasks_get;
-
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    let tasks = tasks_get(&config);
-
-    let root = tasks
-        .iter()
-        .find(|t| t.id == "test-ancestry-path.md:1")
-        .expect("root not found");
-    let rooted = get_task_ancestors(&config, root);
-
-    assert_eq!(
-        rooted.id, "test-ancestry-path.md:1",
-        "root task should remain itself"
-    );
-    assert_eq!(
-        rooted.children.len(),
-        root.children.len(),
-        "root task children should be unchanged"
-    );
-}
-
-#[test]
-fn test_change_state_updates_task() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = task_change_state(&config, "test-state-1.md:1", "IN_PROGRESS");
-    assert!(result.is_ok(), "state change should succeed");
-
-    let task = task_get_by_id(&config, "test-state-1.md:1");
-    assert_eq!(task.state, "IN_PROGRESS", "state should be IN_PROGRESS");
-    assert!(
-        task.body.contains("#IN_PROGRESS"),
-        "body should contain #IN_PROGRESS"
-    );
-
-    let _ = task_change_state(&config, "test-state-1.md:1", "TODO");
-}
-
-#[test]
-fn test_change_state_cycle() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let _ = task_change_state(&config, "test-state-2.md:1", "IN_PROGRESS");
-    let task = task_get_by_id(&config, "test-state-2.md:1");
-    assert_eq!(task.state, "IN_PROGRESS");
-
-    let _ = task_change_state(&config, "test-state-2.md:1", "DONE");
-    let task = task_get_by_id(&config, "test-state-2.md:1");
-    assert_eq!(task.state, "DONE");
-
-    let _ = task_change_state(&config, "test-state-2.md:1", "TODO");
-}
-
-#[test]
-fn test_change_state_preserves_properties() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let _ = task_change_state(&config, "test-state-3.md:1", "DONE");
-    let task = task_get_by_id(&config, "test-state-3.md:1");
-    assert_eq!(task.state, "DONE", "state should be DONE after change");
-    assert_eq!(
-        task.properties.get("scheduled"),
-        Some(&"2024-06-01".to_string()),
-        "properties should be preserved after state change"
-    );
-
-    let _ = task_change_state(&config, "test-state-3.md:1", "TODO");
-}
-
-#[test]
-fn test_change_property_add_and_retrieve() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = task_change_property(&config, "test-state-4.md:1", "priority", Some("high"));
-    assert!(result.is_ok(), "property change should succeed");
-
-    let task = task_get_by_id(&config, "test-state-4.md:1");
-    assert_eq!(
-        task.properties.get("priority"),
-        Some(&"high".to_string()),
-        "priority property should be added"
-    );
-
-    let _ = task_change_property(&config, "test-state-4.md:1", "priority", None);
-}
-
-#[test]
-fn test_change_property_update_and_retrieve() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let _ = task_change_property(
-        &config,
-        "test-state-5.md:1",
-        "scheduled",
-        Some("2025-12-25"),
-    );
-    let task = task_get_by_id(&config, "test-state-5.md:1");
-    assert_eq!(
-        task.properties.get("scheduled"),
-        Some(&"2025-12-25".to_string()),
-        "scheduled property should be updated"
-    );
-
-    let _ = task_change_property(
-        &config,
-        "test-state-5.md:1",
-        "scheduled",
-        Some("2024-06-01"),
-    );
-}
-
-#[test]
-fn test_change_property_remove_and_retrieve() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let _ = task_change_property(&config, "test-state-6.md:1", "scheduled", None);
-    let task = task_get_by_id(&config, "test-state-6.md:1");
-    assert!(
-        !task.properties.contains_key("scheduled"),
-        "scheduled property should be removed"
-    );
-
-    let _ = task_change_property(
-        &config,
-        "test-state-6.md:1",
-        "scheduled",
-        Some("2024-06-01"),
-    );
-}
-
-#[test]
-fn test_change_state_returns_updated_task_via_cli() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let _ = task_change_state(&config, "test-state-7.md:1", "IN_PROGRESS");
-    let task = task_get_by_id(&config, "test-state-7.md:1");
-    assert_eq!(task.id, "test-state-7.md:1");
-    assert_eq!(task.state, "IN_PROGRESS");
-    assert!(
-        task.children.is_empty(),
-        "returned task should have no children"
-    );
-
-    let _ = task_change_state(&config, "test-state-7.md:1", "TODO");
-}
-
-#[test]
-fn test_include_ancestors_deduplicates_child_in_results() {
-    use crate::cli::{collect_child_ids, get_task_ancestors, merge_task_trees};
-    use crate::task::task_get_by_id;
-    use std::collections::HashSet;
-
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let parent = task_get_by_id(&config, "test-ancestor-dedup.md:1");
-    let child = task_get_by_id(&config, "test-ancestor-dedup.md:4");
-
-    let rooted_parent = get_task_ancestors(&config, &parent);
-    let rooted_child = get_task_ancestors(&config, &child);
-
-    let merged = merge_task_trees(vec![rooted_parent, rooted_child]);
-
-    let mut non_roots: HashSet<String> = HashSet::new();
-    for root in &merged {
-        collect_child_ids(root, &mut non_roots);
+    #[test]
+    fn filtered_children_include_all_states() {
+        let config = AgendaConfig::new(vault_path("include-children-filtered"));
+        let tasks = load_all("include-children-filtered");
+        let mut matched = tasks_filter_by_tag(&tasks, "bug");
+        for task in &mut matched {
+            *task = resolve_task_tree(&config, &task.id);
+        }
+        let parent = matched.iter().find(|t| t.title == "parent").unwrap();
+        // children include DONE tasks even though filter affected parent matching
+        assert!(parent.children.iter().any(|c| c.state == "DONE"));
     }
-    let deduped: Vec<_> = merged
-        .into_iter()
-        .filter(|t| !non_roots.contains(&t.id))
-        .collect();
-
-    assert_eq!(deduped.len(), 1, "should have exactly one root after dedup");
-    assert_eq!(
-        deduped[0].id, "test-ancestor-dedup.md:1",
-        "root should be the parent"
-    );
-}
-
-#[test]
-fn test_property_date_matches_datetime() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = tasks_grep_property(&config, "scheduled=2026-04-13").unwrap();
-
-    assert!(
-        result.contains("test-date-filter.md:1"),
-        "should find task with date-only scheduled"
-    );
-    assert!(
-        result.contains("test-date-filter.md:2"),
-        "should find task with datetime scheduled when filtering by date only"
-    );
-    assert!(
-        !result.contains("test-date-filter.md:3"),
-        "should NOT find task with different date"
-    );
-}
-
-#[test]
-fn test_property_date_filter_in_memory() {
-    use crate::task::{tasks_filter_by_property, tasks_get};
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    let tasks = tasks_get(&config);
-
-    let filtered = tasks_filter_by_property(&tasks, "scheduled", Some("2026-04-13"));
-
-    let date_only = filtered.iter().find(|t| t.id == "test-date-filter.md:1");
-    let with_time = filtered.iter().find(|t| t.id == "test-date-filter.md:2");
-    let different = filtered.iter().find(|t| t.id == "test-date-filter.md:3");
-
-    assert!(date_only.is_some(), "date-only task should match");
-    assert!(
-        with_time.is_some(),
-        "datetime task should match when filtering by date"
-    );
-    assert!(different.is_none(), "different date should not match");
-}
-
-#[test]
-fn test_set_fields_content_only() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = task_set_fields(
-        &config,
-        "test-set-content.md:1",
-        Some("updated task content"),
-        None,
-        None,
-        None,
-    );
-    assert!(result.is_ok(), "set fields should succeed: {:?}", result);
-
-    let task = task_get_by_id(&config, "test-set-content.md:1");
-    assert_eq!(task.content, "updated task content");
-    assert_eq!(task.state, "TODO");
-    assert_eq!(task.properties.get("scheduled"), Some(&"2024-06-01".to_string()));
-
-    let _ = task_set_fields(
-        &config,
-        "test-set-content.md:1",
-        Some("set content test"),
-        None,
-        None,
-        None,
-    );
-}
-
-#[test]
-fn test_set_fields_state_only() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let result = task_set_fields(
-        &config,
-        "test-set-state.md:1",
-        None,
-        Some("DONE"),
-        None,
-        None,
-    );
-    assert!(result.is_ok(), "set fields state should succeed: {:?}", result);
-
-    let task = task_get_by_id(&config, "test-set-state.md:1");
-    assert_eq!(task.state, "DONE");
-    assert_eq!(task.content, "set state test");
-    assert_eq!(task.properties.get("scheduled"), Some(&"2024-06-01".to_string()));
-
-    let _ = task_set_fields(
-        &config,
-        "test-set-state.md:1",
-        None,
-        Some("TODO"),
-        None,
-        None,
-    );
-}
-
-#[test]
-fn test_set_fields_properties_merge() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let mut props = std::collections::HashMap::new();
-    props.insert("priority".to_string(), "1".to_string());
-    props.insert("scheduled".to_string(), "2025-12-25".to_string());
-
-    let result = task_set_fields(
-        &config,
-        "test-set-props.md:1",
-        None,
-        None,
-        Some(&props),
-        None,
-    );
-    assert!(result.is_ok(), "set fields properties should succeed: {:?}", result);
-
-    let task = task_get_by_id(&config, "test-set-props.md:1");
-    assert_eq!(task.properties.get("priority"), Some(&"1".to_string()));
-    assert_eq!(task.properties.get("scheduled"), Some(&"2025-12-25".to_string()));
-
-    let _ = task_change_property(&config, "test-set-props.md:1", "priority", None);
-    let _ = task_change_property(&config, "test-set-props.md:1", "scheduled", Some("2024-06-01"));
-}
-
-#[test]
-fn test_set_fields_tags_replace() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let tags = vec!["urgent".to_string(), "release".to_string()];
-
-    let result = task_set_fields(
-        &config,
-        "test-set-tags.md:1",
-        None,
-        None,
-        None,
-        Some(&tags),
-    );
-    assert!(result.is_ok(), "set fields tags should succeed: {:?}", result);
-
-    let task = task_get_by_id(&config, "test-set-tags.md:1");
-    assert_eq!(task.tags, vec!["urgent", "release"]);
-    assert_eq!(task.state, "IN_PROGRESS");
-    assert_eq!(task.properties.get("priority"), Some(&"high".to_string()));
-
-    let original_tags = vec!["bug".to_string()];
-    let _ = task_set_fields(
-        &config,
-        "test-set-tags.md:1",
-        None,
-        None,
-        None,
-        Some(&original_tags),
-    );
-}
-
-#[test]
-fn test_set_fields_multiple_fields() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-
-    let mut props = std::collections::HashMap::new();
-    props.insert("due".to_string(), "2025-01-01".to_string());
-
-    let tags = vec!["important".to_string()];
-
-    let result = task_set_fields(
-        &config,
-        "test-set-multi.md:1",
-        Some("completely new content"),
-        Some("IN_PROGRESS"),
-        Some(&props),
-        Some(&tags),
-    );
-    assert!(result.is_ok(), "set fields multiple should succeed: {:?}", result);
-
-    let task = task_get_by_id(&config, "test-set-multi.md:1");
-    assert_eq!(task.content, "completely new content");
-    assert_eq!(task.state, "IN_PROGRESS");
-    assert_eq!(task.properties.get("scheduled"), Some(&"2024-06-01".to_string()));
-    assert_eq!(task.properties.get("due"), Some(&"2025-01-01".to_string()));
-    assert!(task.tags.contains(&"important".to_string()));
-
-    let _ = task_set_fields(
-        &config,
-        "test-set-multi.md:1",
-        Some("set multi test"),
-        Some("TODO"),
-        None,
-        None,
-    );
-    let _ = task_change_property(&config, "test-set-multi.md:1", "due", None);
-}
-
-#[test]
-fn test_capture_to_file() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    let result = task_capture(
-        &config,
-        "integration test task",
-        "test-capture-integration.md",
-        None,
-        &std::collections::HashMap::new(),
-        &["test".to_string()],
-    );
-    assert!(result.is_ok(), "capture to file should succeed: {:?}", result);
-    let task_id = result.unwrap();
-    assert!(task_id.starts_with("test-capture-integration.md:"));
-
-    let _ = std::fs::remove_file("test-vault/test-capture-integration.md");
-}
-
-#[test]
-fn test_capture_to_task_id() {
-    use std::fs;
-
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    fs::write(
-        "test-vault/test-capture-parent.md",
-        "* #TODO parent task",
-    ).unwrap();
-
-    let result = task_capture(
-        &config,
-        "subtask from integration test",
-        "test-capture-parent.md:1",
-        Some("IN_PROGRESS"),
-        &std::collections::HashMap::new(),
-        &[],
-    );
-    assert!(result.is_ok(), "capture to task ID should succeed: {:?}", result);
-    let task_id = result.unwrap();
-    assert!(task_id.starts_with("test-capture-parent.md:2"));
-
-    fs::write(
-        "test-vault/test-capture-parent.md",
-        "* #TODO parent task\n  * #TODO subtask from integration test",
-    ).unwrap();
-    let content = fs::read_to_string("test-vault/test-capture-parent.md").unwrap();
-    assert!(content.contains("subtask from integration test"));
-    assert!(content.contains("IN_PROGRESS"));
-
-    let _ = std::fs::remove_file("test-vault/test-capture-parent.md");
-}
-
-#[test]
-fn test_capture_invalid_task_id() {
-    let config = AgendaConfig::new(PathBuf::from("test-vault"));
-    let result = task_capture(
-        &config,
-        "should fail",
-        "nonexistent.md:99",
-        None,
-        &std::collections::HashMap::new(),
-        &[],
-    );
-    assert!(result.is_err());
 }
