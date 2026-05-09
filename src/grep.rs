@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use crate::config::AgendaConfig;
 
-pub const TASK_STATES: &[&str] = &["TODO", "IN_PROGRESS", "DONE", "NEXT", "WAIT", "LATER", "ARCHIVED"];
+pub const TASK_STATES: &[&str] = &["TODO", "IN_PROGRESS", "DONE", "NEXT", "WAIT", "LATER", "CANCELLED", "ARCHIVED"];
 
 pub fn task_state_next(current: &str) -> String {
     if let Some(index) = TASK_STATES.iter().position(|&s| s == current) {
@@ -639,7 +639,8 @@ mod tests {
         assert_eq!(task_state_next("DONE"), "NEXT");
         assert_eq!(task_state_next("NEXT"), "WAIT");
         assert_eq!(task_state_next("WAIT"), "LATER");
-        assert_eq!(task_state_next("LATER"), "ARCHIVED");
+        assert_eq!(task_state_next("LATER"), "CANCELLED");
+        assert_eq!(task_state_next("CANCELLED"), "ARCHIVED");
         assert_eq!(task_state_next("ARCHIVED"), "TODO");
         assert_eq!(task_state_next("UNKNOWN"), "TODO");
     }
@@ -647,7 +648,8 @@ mod tests {
     #[test]
     fn test_task_state_prev() {
         assert_eq!(task_state_prev("TODO"), "ARCHIVED");
-        assert_eq!(task_state_prev("ARCHIVED"), "LATER");
+        assert_eq!(task_state_prev("ARCHIVED"), "CANCELLED");
+        assert_eq!(task_state_prev("CANCELLED"), "LATER");
         assert_eq!(task_state_prev("LATER"), "WAIT");
         assert_eq!(task_state_prev("WAIT"), "NEXT");
         assert_eq!(task_state_prev("NEXT"), "DONE");

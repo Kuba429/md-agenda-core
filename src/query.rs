@@ -455,20 +455,40 @@ pub fn analyze_query(expr: &FilterExpr) -> GrepStrategy {
         FilterExpr::Title(_) => GrepStrategy::All,
         FilterExpr::Or(left, right) => {
             let tags = collect_or_tags(expr);
-            if !tags.is_empty() {
+            if !tags.is_empty() && is_pure_tag_or(expr) {
                 return GrepStrategy::MultiTag { tags };
             }
             let states = collect_or_states(expr);
-            if !states.is_empty() {
+            if !states.is_empty() && is_pure_state_or(expr) {
                 return GrepStrategy::IncludeState {
                     states: states.into_iter().collect(),
                 };
             }
             let left_strategy = best_and_leaf(left);
             let right_strategy = best_and_leaf(right);
-            pick_better(left_strategy, right_strategy)
+            if left_strategy == right_strategy {
+                left_strategy
+            } else {
+                GrepStrategy::All
+            }
         }
         FilterExpr::And(_, _) => best_and_leaf(expr),
+    }
+}
+
+fn is_pure_tag_or(expr: &FilterExpr) -> bool {
+    match expr {
+        FilterExpr::Tag(_) => true,
+        FilterExpr::Or(left, right) => is_pure_tag_or(left) && is_pure_tag_or(right),
+        _ => false,
+    }
+}
+
+fn is_pure_state_or(expr: &FilterExpr) -> bool {
+    match expr {
+        FilterExpr::State(_) => true,
+        FilterExpr::Or(left, right) => is_pure_state_or(left) && is_pure_state_or(right),
+        _ => false,
     }
 }
 
@@ -529,18 +549,22 @@ fn best_and_leaf(expr: &FilterExpr) -> GrepStrategy {
         }
         FilterExpr::Or(left, right) => {
             let tags = collect_or_tags(expr);
-            if !tags.is_empty() {
+            if !tags.is_empty() && is_pure_tag_or(expr) {
                 return GrepStrategy::MultiTag { tags };
             }
             let states = collect_or_states(expr);
-            if !states.is_empty() {
+            if !states.is_empty() && is_pure_state_or(expr) {
                 return GrepStrategy::IncludeState {
                     states: states.into_iter().collect(),
                 };
             }
             let left_strategy = best_and_leaf(left);
             let right_strategy = best_and_leaf(right);
-            pick_better(left_strategy, right_strategy)
+            if left_strategy == right_strategy {
+                left_strategy
+            } else {
+                GrepStrategy::All
+            }
         }
         FilterExpr::And(left, right) => {
             let left_strategy = best_and_leaf(left);
@@ -1272,10 +1296,10 @@ use crate::task::Task;
     }
 
     #[test]
-    fn test_analyze_mixed_or_returns_tag() {
+    fn test_analyze_mixed_or_returns_all() {
         let expr = parse_query("tag:foo OR state:TODO").unwrap();
         let strategy = analyze_query(&expr);
-        assert_eq!(strategy, GrepStrategy::MultiTag { tags: vec!["foo".to_string()] });
+        assert_eq!(strategy, GrepStrategy::All);
     }
 
     #[test]

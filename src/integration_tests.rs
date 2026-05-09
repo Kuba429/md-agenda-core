@@ -385,6 +385,142 @@ mod query_grep_strategy {
         let result = filter_tasks(&expr, &tasks);
         assert_eq!(result.len(), 6);
     }
+
+    #[test]
+    fn analyze_or_property_different_values() {
+        let expr = parse_query("property:scheduled=2026-05-14 OR property:scheduled=2026-05-15").unwrap();
+        let strategy = analyze_query(&expr);
+        assert_eq!(strategy, GrepStrategy::All,
+            "OR of properties with different values must use All strategy");
+    }
+
+    #[test]
+    fn analyze_or_same_property_value() {
+        let expr = parse_query("property:scheduled=2026-05-15 OR property:scheduled=2026-05-15").unwrap();
+        let strategy = analyze_query(&expr);
+        assert_eq!(strategy, GrepStrategy::Property { property: "scheduled=2026-05-15".to_string() },
+            "OR of identical property values should reuse the same strategy");
+    }
+
+    #[test]
+    fn analyze_or_excludestate_and_property() {
+        let expr = parse_query("(-state:DONE) OR property:scheduled=2026-05-15").unwrap();
+        let strategy = analyze_query(&expr);
+        assert_eq!(strategy, GrepStrategy::All,
+            "OR of ExcludeState and Property must use All strategy");
+    }
+
+    #[test]
+    fn analyze_or_complex_state_exclusion_and_property_chain() {
+        let expr = parse_query(
+            "(-state:DONE AND -state:CANCELLED AND -state:ARCHIVED) OR \
+             (property:scheduled=2026-05-14 OR property:scheduled=2026-05-15 OR property:scheduled=2026-05-16)"
+        ).unwrap();
+        let strategy = analyze_query(&expr);
+        assert_eq!(strategy, GrepStrategy::All,
+            "OR of complex state exclusion and property chain must use All strategy");
+    }
+}
+
+#[cfg(test)]
+mod query_and_or_strategy {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::query::{analyze_query, filter_tasks, parse_query, GrepStrategy};
+    use crate::repository::MarkdownTaskRepository;
+
+    fn load_via_strategy_on(scenario: &str, strategy: &GrepStrategy) -> Vec<crate::task::Task> {
+        let config = AgendaConfig::new(vault_path(scenario));
+        let repo = MarkdownTaskRepository::new(config);
+        repo.load_tasks_for_query(strategy).unwrap()
+    }
+
+    #[test]
+    fn property_or_where_first_date_missing() {
+        let expr = parse_query("property:scheduled=2026-05-14 OR property:scheduled=2026-05-15").unwrap();
+        let strategy = analyze_query(&expr);
+        let tasks = load_via_strategy_on("query-and-or-multi", &strategy);
+        let result = filter_tasks(&expr, &tasks);
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert!(titles.contains(&"task_a"), "task_a has scheduled=2026-05-15");
+        assert_eq!(result.len(), 1, "titles: {:?}", titles);
+    }
+
+    #[test]
+    fn state_exclusion_or_property_chain() {
+        let expr = parse_query(
+            "(-state:DONE) OR \
+             (property:scheduled=2026-05-15 OR property:scheduled=2026-05-16)"
+        ).unwrap();
+        let strategy = analyze_query(&expr);
+        let tasks = load_via_strategy_on("query-and-or-multi", &strategy);
+        let result = filter_tasks(&expr, &tasks);
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        // task_a: -state:DONE? yes (TODO) → left ✓
+        // task_b: -state:DONE? no (DONE) → left ✗. property:scheduled=2026-05-16? yes → right ✓
+        // task_c: -state:DONE? yes (TODO) → left ✓
+        // task_d: -state:DONE? yes (CANCELLED, not DONE) → left ✓
+        assert!(titles.contains(&"task_a"), "task_a: left side (TODO, not DONE)");
+        assert!(titles.contains(&"task_b"), "task_b: right side (scheduled=16)");
+        assert!(titles.contains(&"task_c"), "task_c: left side (TODO, not DONE)");
+        assert!(titles.contains(&"task_d"), "task_d: left side (CANCELLED, not DONE)");
+        assert_eq!(result.len(), 4, "titles: {:?}", titles);
+    }
+
+    #[test]
+    fn complex_state_exclusion_or_property_chain() {
+        let expr = parse_query(
+            "(-state:DONE AND -state:CANCELLED AND -state:ARCHIVED) OR \
+             (property:scheduled=2026-05-14 OR property:scheduled=2026-05-15 OR property:scheduled=2026-05-16)"
+        ).unwrap();
+        let strategy = analyze_query(&expr);
+        let tasks = load_via_strategy_on("query-and-or-multi", &strategy);
+        let result = filter_tasks(&expr, &tasks);
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        // task_a: -state:DONE? yes (TODO) → left ✓. -state:CANCELLED? yes → left ✓. -state:ARCHIVED? yes → left ✓
+        // task_b: -state:DONE? no (DONE) → left ✗. property:scheduled=2026-05-16? yes → right ✓
+        // task_c: -state:DONE? yes (TODO) → left ✓
+        // task_d: -state:DONE? yes (CANCELLED) → left ✓. -state:CANCELLED? no (CANCELLED) → left ✗
+        //         property:scheduled=2026-05-16? yes → right ✓
+        assert!(titles.contains(&"task_a"), "task_a: left side (TODO)");
+        assert!(titles.contains(&"task_b"), "task_b: right side (scheduled=16)");
+        assert!(titles.contains(&"task_c"), "task_c: left side (TODO)");
+        assert!(titles.contains(&"task_d"), "task_d: right side (scheduled=16)");
+        assert_eq!(result.len(), 4, "titles: {:?}", titles);
+    }
+
+    #[test]
+    fn property_or_first_date_in_second_file() {
+        let expr = parse_query(
+            "property:scheduled=2026-05-17 OR property:scheduled=2026-05-15"
+        ).unwrap();
+        let strategy = analyze_query(&expr);
+        let tasks = load_via_strategy_on("query-and-or-multi", &strategy);
+        let result = filter_tasks(&expr, &tasks);
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert!(titles.contains(&"task_a"), "task_a has scheduled=2026-05-15");
+        assert_eq!(result.len(), 1, "titles: {:?}", titles);
+    }
+
+    #[test]
+    fn or_between_tag_and_property() {
+        let expr = parse_query("tag:foo OR property:scheduled=2026-05-15").unwrap();
+        let strategy = analyze_query(&expr);
+        let tasks = load_via_strategy_on("query-and-or-multi", &strategy);
+        let result = filter_tasks(&expr, &tasks);
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert!(titles.contains(&"task_a"), "task_a has scheduled=2026-05-15 (right side)");
+        assert_eq!(result.len(), 1, "titles: {:?}", titles);
+    }
+
+    #[test]
+    fn non_existent_property_or_returns_empty() {
+        let expr = parse_query("property:scheduled=2026-05-99 OR property:scheduled=2026-05-98").unwrap();
+        let strategy = analyze_query(&expr);
+        let tasks = load_via_strategy_on("query-and-or-multi", &strategy);
+        let result = filter_tasks(&expr, &tasks);
+        assert!(result.is_empty(), "no tasks match non-existent dates");
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +603,52 @@ mod parent_children {
         assert!(children.iter().any(|c| c.title == "child1"));
         assert!(children.iter().any(|c| c.title == "child2"));
         assert!(children.iter().all(|c| c.state == "TODO" || c.state == "DONE"));
+    }
+
+    #[test]
+    fn deep_nesting_returns_direct_child_only() {
+        let config = AgendaConfig::new(vault_path("parent-deep-nesting"));
+        let children = task_get_direct_children(&config, "file.md:1");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].title, "level2");
+    }
+
+    #[test]
+    fn deep_nesting_level2_returns_level3() {
+        let config = AgendaConfig::new(vault_path("parent-deep-nesting"));
+        let children = task_get_direct_children(&config, "file.md:2");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].title, "level3");
+    }
+
+    #[test]
+    fn deep_nesting_level4_returns_level5() {
+        let config = AgendaConfig::new(vault_path("parent-deep-nesting"));
+        let children = task_get_direct_children(&config, "file.md:4");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].title, "level5");
+    }
+
+    #[test]
+    fn deep_nesting_traverse_root_to_leaf() {
+        let config = AgendaConfig::new(vault_path("parent-deep-nesting"));
+        let l2 = task_get_direct_children(&config, "file.md:1");
+        assert_eq!(l2[0].title, "level2");
+        let l3 = task_get_direct_children(&config, &l2[0].id);
+        assert_eq!(l3[0].title, "level3");
+        let l4 = task_get_direct_children(&config, &l3[0].id);
+        assert_eq!(l4[0].title, "level4");
+        let l5 = task_get_direct_children(&config, &l4[0].id);
+        assert_eq!(l5[0].title, "level5");
+        assert!(l5[0].children.is_empty(), "level5 has no children");
+    }
+
+    #[test]
+    fn deep_nesting_level3_returns_level4() {
+        let config = AgendaConfig::new(vault_path("parent-deep-nesting"));
+        let children = task_get_direct_children(&config, "file.md:3");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].title, "level4");
     }
 }
 
@@ -572,5 +754,320 @@ mod include_children {
         let parent = matched.iter().find(|t| t.title == "parent").unwrap();
         // children include DONE tasks even though filter affected parent matching
         assert!(parent.children.iter().any(|c| c.state == "DONE"));
+    }
+}
+
+#[cfg(test)]
+mod task_body {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::task::task_get_by_id;
+
+    #[test]
+    fn body_trim_whitespace() {
+        let config = AgendaConfig::new(vault_path("body-trim-whitespace"));
+        let task = task_get_by_id(&config, "file.md:1");
+
+        assert!(task.body.contains("extra spaces here"));
+        assert!(!task.body.starts_with("extra spaces here"), "body has relative indent");
+    }
+
+    #[test]
+    fn body_multiline() {
+        let config = AgendaConfig::new(vault_path("body-multiline"));
+        let task = task_get_by_id(&config, "file.md:1");
+
+        assert_eq!(task.body, "Line one of body\nLine two of body\nLine three of body");
+    }
+
+    #[test]
+    fn body_with_code() {
+        let config = AgendaConfig::new(vault_path("body-with-code"));
+        let task = task_get_by_id(&config, "file.md:1");
+
+        assert!(task.body.contains("```"));
+        assert!(task.body.contains("fn main()"));
+    }
+}
+
+#[cfg(test)]
+mod additional_filtering {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::query::parse_and_filter;
+    use crate::repository::MarkdownTaskRepository;
+
+    fn load_tasks(scenario: &str) -> Vec<crate::task::Task> {
+        let config = AgendaConfig::new(vault_path(scenario));
+        let repo = MarkdownTaskRepository::new(config);
+        repo.load_all_tasks().unwrap()
+    }
+
+    #[test]
+    fn filter_multi_property_scheduled_and_priority() {
+        let tasks = load_tasks("filter-multi-property");
+        let result = parse_and_filter("property:scheduled=2024-01-01 AND property:priority=high", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "task2");
+    }
+
+    #[test]
+    fn filter_multi_property_all_three() {
+        let tasks = load_tasks("filter-multi-property");
+        let result = parse_and_filter("property:scheduled=2024-01-02 AND property:priority=high", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "task3");
+    }
+
+    #[test]
+    fn filter_content_search_title() {
+        let tasks = load_tasks("filter-content-search");
+        let result = parse_and_filter("title:login", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].title.contains("login"));
+    }
+
+    #[test]
+    fn filter_content_search_title_api() {
+        let tasks = load_tasks("filter-content-search");
+        let result = parse_and_filter("title:documentation", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn filter_content_search_title_nonexistent() {
+        let tasks = load_tasks("filter-content-search");
+        let result = parse_and_filter("title:nonexistent", &tasks).unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn filter_date_exact_match() {
+        let tasks = load_tasks("filter-date-range");
+        let result = parse_and_filter("property:scheduled=2024-01-15", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "task2");
+    }
+
+    #[test]
+    fn filter_date_range_combined() {
+        let tasks = load_tasks("filter-date-range");
+        let result = parse_and_filter("property:scheduled=2024-01-01 OR property:scheduled=2024-01-15", &tasks).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn filter_empty_results_state_done() {
+        let tasks = load_tasks("filter-empty-results");
+        let result = parse_and_filter("state:DONE", &tasks).unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn filter_empty_results_priority_medium() {
+        let tasks = load_tasks("filter-empty-results");
+        let result = parse_and_filter("property:priority=medium", &tasks).unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn filter_empty_results_nonexistent_tag() {
+        let tasks = load_tasks("filter-empty-results");
+        let result = parse_and_filter("tag:nonexistent", &tasks).unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn filter_priority_values_low() {
+        let tasks = load_tasks("filter-priority-values");
+        let result = parse_and_filter("property:priority=low", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "task1");
+    }
+
+    #[test]
+    fn filter_priority_values_high() {
+        let tasks = load_tasks("filter-priority-values");
+        let result = parse_and_filter("property:priority=high", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "task3");
+    }
+
+    #[test]
+    fn filter_priority_values_urgent() {
+        let tasks = load_tasks("filter-priority-values");
+        let result = parse_and_filter("property:priority=urgent", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "task5");
+    }
+
+#[test]
+    fn filter_priority_values_none() {
+        let tasks = load_tasks("filter-priority-values");
+        let result = parse_and_filter("-property:priority", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "task4");
+    }
+}
+
+#[cfg(test)]
+mod complex_queries {
+    use super::scenarios::*;
+    use crate::config::AgendaConfig;
+    use crate::query::parse_and_filter;
+    use crate::repository::MarkdownTaskRepository;
+
+    fn load_tasks(scenario: &str) -> Vec<crate::task::Task> {
+        let config = AgendaConfig::new(vault_path(scenario));
+        let repo = MarkdownTaskRepository::new(config);
+        repo.load_all_tasks().unwrap()
+    }
+
+    #[test]
+    fn complex_2_level_and() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("tag:foo AND property:priority=high", &tasks).unwrap();
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(result.len(), 4, "titles: {:?}", titles);
+        assert!(titles.contains(&"task1"));
+        assert!(titles.contains(&"task3"));
+    }
+
+    #[test]
+    fn complex_2_level_or() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("tag:foo OR tag:bar", &tasks).unwrap();
+        assert!(result.len() >= 5);
+    }
+
+    #[test]
+    fn complex_2_level_not() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("-tag:foo", &tasks).unwrap();
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert!(titles.contains(&"task2"));
+        assert!(titles.contains(&"task5"));
+        assert!(titles.contains(&"task6"));
+        assert!(!titles.contains(&"task1"));
+    }
+
+    #[test]
+    fn complex_3_level_and_not() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("tag:foo AND property:priority=high AND -tag:bar", &tasks).unwrap();
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(result.len(), 3);
+        assert!(titles.contains(&"task1"));
+        assert!(titles.contains(&"task8"));
+    }
+
+    #[test]
+    fn complex_3_level_or_not() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("tag:foo OR (tag:bar AND -property:priority=low)", &tasks).unwrap();
+        assert!(result.len() >= 4);
+    }
+
+    #[test]
+    fn complex_4_level_and_not() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("tag:foo AND property:priority=high AND -tag:bar", &tasks).unwrap();
+        assert!(result.len() >= 1);
+    }
+
+    #[test]
+    fn complex_5_level_nested_or() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("tag:foo AND (property:priority=high OR property:priority=medium) AND -tag:bar", &tasks).unwrap();
+        assert!(result.len() >= 1);
+    }
+
+    #[test]
+    fn complex_6_level_double_not() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("-tag:foo AND -tag:bar", &tasks).unwrap();
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn complex_7_level_mixed() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("(tag:foo OR tag:bar) AND property:priority=high AND -state:DONE", &tasks).unwrap();
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn complex_not_state_done() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("tag:foo AND -state:DONE", &tasks).unwrap();
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(result.len(), 5);
+        assert!(!titles.contains(&"task11"));
+    }
+
+    #[test]
+    fn complex_triple_and() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("tag:foo AND tag:bar AND property:priority=high", &tasks).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "task3");
+    }
+
+    #[test]
+    fn complex_double_negator_and() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("-tag:foo AND -tag:bar", &tasks).unwrap();
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn complex_or_with_and_not() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("(tag:foo OR tag:bar) AND -state:DONE", &tasks).unwrap();
+        assert!(result.len() >= 4);
+    }
+
+    #[test]
+    fn complex_not_property_high() {
+        let tasks = load_tasks("query-complex");
+        let result = parse_and_filter("-property:priority=high", &tasks).unwrap();
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn query_and_or_precedence_left_side_only() {
+        let tasks = load_tasks("query-and-or-precedence");
+        let result = parse_and_filter("-state:DONE AND -state:CANCELLED AND -state:ARCHIVED", &tasks).unwrap();
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(result.len(), 2, "titles: {:?}", titles);
+        assert!(titles.contains(&"task1"));
+        assert!(titles.contains(&"task2"));
+    }
+
+    #[test]
+    fn query_and_or_precedence_right_side_only() {
+        let tasks = load_tasks("query-and-or-precedence");
+        let result = parse_and_filter("property:scheduled=2026-05-12 OR property:scheduled=2026-05-13 OR property:scheduled=2026-05-14 OR property:scheduled=2026-05-15 OR property:scheduled=2026-05-16", &tasks).unwrap();
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(result.len(), 5, "titles: {:?}", titles);
+        assert!(titles.contains(&"task1"));
+        assert!(titles.contains(&"task2"));
+        assert!(titles.contains(&"task3"));
+        assert!(titles.contains(&"task4"));
+        assert!(titles.contains(&"task5"));
+    }
+
+    #[test]
+    fn query_and_or_precedence_full_query() {
+        let tasks = load_tasks("query-and-or-precedence");
+        let result = parse_and_filter("(-state:DONE AND -state:CANCELLED AND -state:ARCHIVED) OR (property:scheduled=2026-05-12 OR property:scheduled=2026-05-13 OR property:scheduled=2026-05-14 OR property:scheduled=2026-05-15 OR property:scheduled=2026-05-16)", &tasks).unwrap();
+        let titles: Vec<_> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(result.len(), 5, "titles: {:?}", titles);
+        assert!(titles.contains(&"task1"));
+        assert!(titles.contains(&"task2"));
+        assert!(titles.contains(&"task3"));
+        assert!(titles.contains(&"task4"));
+        assert!(titles.contains(&"task5"));
+        assert!(!titles.contains(&"task6"));
     }
 }
